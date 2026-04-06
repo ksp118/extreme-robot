@@ -134,12 +134,13 @@ RViz가 처음 열리면 빈 화면에 로봇이 보이지 않습니다. 아래 
 
 설정이 완료되면 로봇팔 모델이 3D 뷰에 나타나며, joint_state_publisher_gui 슬라이더로 각 관절을 움직여볼 수 있습니다.
 
-> **참고**: `joint_state_publisher_gui`가 없다는 에러가 나오면 컨테이너 안에서 설치하세요:
->
+> **수정함** : Dockerfile에 `joint_state_publisher_gui` 추가. 이미지에 포함된 상태로 변경
+> ~~**참고**: `joint_state_publisher_gui`가 없다는 에러가 나오면 컨테이너 안에서 설치하세요:~~
+>~~
 > ```bash
 > apt update && apt install -y ros-humble-joint-state-publisher-gui
 > ```
-
+~~
 ---
 
 ## 일상적인 작업 흐름
