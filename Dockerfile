@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     ros-humble-teleop-twist-keyboard \
     ros-humble-rqt \
     ros-humble-rqt-graph \
+    ros-humble-joint-state-publisher-gui \
     python3-pip \
     nano \
     && rm -rf /var/lib/apt/lists/*
