@@ -36,7 +36,9 @@ class KeyboardTeleop(Node):
     def __init__(self):
         super().__init__("keyboard_teleop")
 
-        self.declare_parameter("joint_names", ["joint_1", "joint_2", "joint_3"])
+        self.declare_parameter(
+            "joint_names", ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5"]
+        )
         self.declare_parameter("step_scale", 1.0)   # displacement 크기 배율
         self.declare_parameter("step_scale_delta", 0.5)
 

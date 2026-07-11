@@ -28,15 +28,47 @@ ADDR_PRESENT_TEMPERATURE = 146
 
 TORQUE_ENABLE = 1
 
-# 사용하는 모터 ID (URDF 기준 active joint 3개: Motor0_1=0, Motor_1=1, Motor1_1=2)
-DXL_IDS = [0, 1, 2]
+# 사용하는 모터 ID (5축 CAD URDF 기준 active joint 5개)
+DXL_IDS = [0, 1, 2, 3, 4]
 
 # URDF joint 이름과 모터 ID 순서를 맞춤
 JOINT_NAMES = [
     "joint_1",
     "joint_2",
     "joint_3",
+    "joint_4",
+    "joint_5",
 ]
+DXL_CENTERS = [2048, 2048, 2048, 2048, 2048]
+DXL_DIRECTIONS = [1, 1, 1, 1, 1]
+JOINT_LIMIT_ENABLED = [True, True, True, True, True]
+JOINT_MIN_RADS = [-math.pi, -math.pi, 0.0, -math.pi / 2.0, -math.pi]
+JOINT_MAX_RADS = [math.pi, 0.0, math.pi, math.pi / 2.0, math.pi]
+TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
+DXL_MIN_TICK = 0
+DXL_MAX_TICK = 4095
+
+
+def rad_to_tick(index, rad):
+    tick = DXL_CENTERS[index] + DXL_DIRECTIONS[index] * rad * TICKS_PER_RAD
+    return max(DXL_MIN_TICK, min(DXL_MAX_TICK, int(round(tick))))
+
+
+def tick_to_rad(index, tick):
+    return (int(tick) - DXL_CENTERS[index]) / (DXL_DIRECTIONS[index] * TICKS_PER_RAD)
+
+
+def clamp_rad(index, rad):
+    if not JOINT_LIMIT_ENABLED[index]:
+        return rad
+    lower = JOINT_MIN_RADS[index]
+    upper = JOINT_MAX_RADS[index]
+    return max(lower, min(upper, rad))
+
+
+def clamp_goal_tick(index, tick):
+    tick = max(DXL_MIN_TICK, min(DXL_MAX_TICK, int(tick)))
+    return rad_to_tick(index, clamp_rad(index, tick_to_rad(index, tick)))
 
 
 class DynamixelPositionNode(Node):
@@ -123,7 +155,8 @@ class DynamixelPositionNode(Node):
             self.get_logger().error(f"Unknown Dynamixel ID: {dxl_id}")
             return
 
-        goal_position = max(0, min(4095, goal_position))
+        index = DXL_IDS.index(dxl_id)
+        goal_position = clamp_goal_tick(index, goal_position)
 
         result, error = self.packet_handler.write4ByteTxRx(
             self.port_handler,
@@ -199,8 +232,7 @@ class DynamixelPositionNode(Node):
             )
 
             # raw position 0~4095를 radian으로 근사 변환
-            # 2048을 중앙, 한 바퀴를 2pi로 가정
-            rad = (int(position) - 2048) * (2.0 * math.pi / 4096.0)
+            rad = tick_to_rad(index, position)
 
             state_data.extend([
                 int(dxl_id),

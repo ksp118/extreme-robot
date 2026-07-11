@@ -28,21 +28,32 @@ TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
 DXL_MIN_TICK = 0
 DXL_MAX_TICK = 4095
 
+DEFAULT_JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5"]
+DEFAULT_MOTOR_IDS = [0, 1, 2, 3, 4]
+DEFAULT_CENTERS = [2048, 2048, 2048, 2048, 2048]
+DEFAULT_DIRECTIONS = [1, 1, 1, 1, 1]
+DEFAULT_LIMIT_ENABLED = [True, True, True, True, True]
+DEFAULT_MIN_RADS = [-math.pi, -math.pi, 0.0, -math.pi / 2.0, -math.pi]
+DEFAULT_MAX_RADS = [math.pi, 0.0, math.pi, math.pi / 2.0, math.pi]
+
 
 class TeleopCore(Node):
     def __init__(self):
         super().__init__("teleop_core")
 
-        # --- 관절 ↔ 모터 매핑 (bridge JOINT_CONFIG 와 동일 기본값; 5축 확정 시 확장) ---
-        self.declare_parameter("joint_names", ["joint_1", "joint_2", "joint_3"])
-        self.declare_parameter("motor_ids", [0, 1, 2])
-        self.declare_parameter("centers", [2048, 2048, 2048])
-        self.declare_parameter("directions", [1, 1, 1])
+        # --- 관절 ↔ 모터 매핑 ---
+        self.declare_parameter("joint_names", DEFAULT_JOINT_NAMES)
+        self.declare_parameter("motor_ids", DEFAULT_MOTOR_IDS)
+        self.declare_parameter("centers", DEFAULT_CENTERS)
+        self.declare_parameter("directions", DEFAULT_DIRECTIONS)
 
         # --- 동작 파라미터 ---
         self.declare_parameter("jog_step_rad", 0.05)      # displacement=±1 당 이동량
-        self.declare_parameter("joint_min_rad", -3.14)    # 소프트 리밋(전 관절 공통 기본)
-        self.declare_parameter("joint_max_rad", 3.14)
+        self.declare_parameter("joint_min_rad", -math.pi) # 호환용 fallback 공통 리밋
+        self.declare_parameter("joint_max_rad", math.pi)
+        self.declare_parameter("joint_limit_enabled", DEFAULT_LIMIT_ENABLED)
+        self.declare_parameter("joint_min_rads", DEFAULT_MIN_RADS)
+        self.declare_parameter("joint_max_rads", DEFAULT_MAX_RADS)
         self.declare_parameter("deadman_timeout_s", 0.5)  # 이 시간 넘게 입력 없으면 velocity 적분 정지
         self.declare_parameter("publish_rate_hz", 20.0)
         # 하드웨어 없이 RViz 디버그: 목표값을 그대로 /joint_states 로도 발행(open-loop).
@@ -53,6 +64,9 @@ class TeleopCore(Node):
         motor_ids = list(self.get_parameter("motor_ids").value)
         centers = list(self.get_parameter("centers").value)
         directions = list(self.get_parameter("directions").value)
+        limit_enabled = list(self.get_parameter("joint_limit_enabled").value)
+        min_rads = list(self.get_parameter("joint_min_rads").value)
+        max_rads = list(self.get_parameter("joint_max_rads").value)
 
         if not (len(self.joint_names) == len(motor_ids) == len(centers) == len(directions)):
             raise RuntimeError(
@@ -68,6 +82,7 @@ class TeleopCore(Node):
         self.jog_step_rad = float(self.get_parameter("jog_step_rad").value)
         self.joint_min_rad = float(self.get_parameter("joint_min_rad").value)
         self.joint_max_rad = float(self.get_parameter("joint_max_rad").value)
+        self.joint_limits = self._build_joint_limits(limit_enabled, min_rads, max_rads)
         self.deadman_timeout_s = float(self.get_parameter("deadman_timeout_s").value)
         self.publish_sim = bool(self.get_parameter("publish_sim_joint_states").value)
         rate = float(self.get_parameter("publish_rate_hz").value)
@@ -98,13 +113,44 @@ class TeleopCore(Node):
 
         self.get_logger().info(
             f"teleop_core started (joints={self.joint_names}, "
-            f"jog_step={self.jog_step_rad} rad, limits=[{self.joint_min_rad}, "
-            f"{self.joint_max_rad}] rad, sim_joint_states={self.publish_sim})"
+            f"jog_step={self.jog_step_rad} rad, limits={self._limit_summary()}, "
+            f"sim_joint_states={self.publish_sim})"
         )
 
     # ------------------------------------------------------------------ helpers
-    def _clamp_rad(self, rad):
-        return max(self.joint_min_rad, min(self.joint_max_rad, rad))
+    def _build_joint_limits(self, enabled, min_rads, max_rads):
+        n = len(self.joint_names)
+        if not (len(enabled) == len(min_rads) == len(max_rads) == n):
+            self.get_logger().warn(
+                "joint_limit_enabled/joint_min_rads/joint_max_rads 길이가 "
+                "joint_names와 맞지 않아 공통 fallback 리밋을 사용합니다"
+            )
+            return {
+                name: (True, self.joint_min_rad, self.joint_max_rad)
+                for name in self.joint_names
+            }
+
+        limits = {}
+        for i, name in enumerate(self.joint_names):
+            lower = float(min_rads[i])
+            upper = float(max_rads[i])
+            if lower > upper:
+                lower, upper = upper, lower
+            limits[name] = (bool(enabled[i]), lower, upper)
+        return limits
+
+    def _limit_summary(self):
+        parts = []
+        for name in self.joint_names:
+            enabled, lower, upper = self.joint_limits[name]
+            parts.append(f"{name}=[{lower:.3f},{upper:.3f}]" if enabled else f"{name}=off")
+        return ", ".join(parts)
+
+    def _clamp_rad(self, name, rad):
+        enabled, lower, upper = self.joint_limits[name]
+        if not enabled:
+            return rad
+        return max(lower, min(upper, rad))
 
     def _rad_to_tick(self, name, rad):
         c = self.cfg[name]
@@ -115,7 +161,7 @@ class TeleopCore(Node):
         """목표가 초기화 안 됐으면 측정값(없으면 0.0=center)으로 채운다 — 시작 튐 방지."""
         if self.goal_rad[name] is None:
             base = self.measured_rad[name]
-            self.goal_rad[name] = 0.0 if base is None else base
+            self.goal_rad[name] = self._clamp_rad(name, 0.0 if base is None else base)
 
     def _publish_goals(self, names):
         """지정 관절들의 현재 목표를 [id, tick] 로 발행."""
@@ -147,7 +193,7 @@ class TeleopCore(Node):
             self._ensure_goal(name)
             if i < len(disp) and disp[i] != 0.0:
                 self.goal_rad[name] = self._clamp_rad(
-                    self.goal_rad[name] + disp[i] * self.jog_step_rad)
+                    name, self.goal_rad[name] + disp[i] * self.jog_step_rad)
                 changed.append(name)
             # velocity 는 타이머에서 처리 (deadman 적용)
             self.velocity[name] = vel[i] if i < len(vel) else 0.0
@@ -160,7 +206,7 @@ class TeleopCore(Node):
         if cmd == "home":
             for name in self.joint_names:
                 self._ensure_goal(name)
-                self.goal_rad[name] = self._clamp_rad(0.0)
+                self.goal_rad[name] = self._clamp_rad(name, 0.0)
             self.velocity = {n: 0.0 for n in self.joint_names}
             self._publish_goals(self.joint_names)
             self.get_logger().info("home: 전 관절 center 복귀")
@@ -168,7 +214,7 @@ class TeleopCore(Node):
             # 현재 측정 위치로 목표 고정 → 그 자리에서 정지
             for name in self.joint_names:
                 if self.measured_rad[name] is not None:
-                    self.goal_rad[name] = self.measured_rad[name]
+                    self.goal_rad[name] = self._clamp_rad(name, self.measured_rad[name])
                 else:
                     self._ensure_goal(name)
             self.velocity = {n: 0.0 for n in self.joint_names}
@@ -205,7 +251,7 @@ class TeleopCore(Node):
             if v != 0.0:
                 self._ensure_goal(name)
                 self.goal_rad[name] = self._clamp_rad(
-                    self.goal_rad[name] + v * self.jog_step_rad * dt)
+                    name, self.goal_rad[name] + v * self.jog_step_rad * dt)
                 moving.append(name)
         if moving:
             self._publish_goals(moving)

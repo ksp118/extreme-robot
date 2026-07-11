@@ -75,9 +75,9 @@ source install/setup.bash
 
 | 패키지 | 역할 |
 | ------ | ---- |
-| **dynamixel_control** | 핵심 런타임. `yolo_detection`(카메라+YOLO) → `yolo_bridge`(P제어) → `position_node`(XL430 서보 구동) 3노드 파이프라인 |
-| **robot_arm_description** | 로봇팔 URDF(6축 + 그리퍼), `display.launch.py`(RViz 시각화) |
-| **robot_arm_moveit_config** | MoveIt 경로계획 설정(SRDF/IK/컨트롤러), `demo.launch.py` |
+| **dynamixel_control** | 핵심 런타임. 5축 키보드 텔레옵, Dynamixel 위치 제어, YOLO 추적 레거시 파이프라인 |
+| **robot_arm_description** | 로봇팔 5축 CAD URDF + STL mesh, `display.launch.py`(RViz 시각화) |
+| **robot_arm_moveit_config** | MoveIt 경로계획 설정(SRDF/IK/컨트롤러). 현재 텔레옵 브랜치에서는 검증 대상 아님 |
 | **pick_test_pkg** | 그리퍼 단독 테스트 노드(`pick_test_node`) |
 
 > 각 패키지·노드의 상세 구조는 [`CLAUDE.md`](CLAUDE.md) 참고.
@@ -106,22 +106,92 @@ RViz와 joint_state_publisher_gui 창이 함께 뜹니다. **RViz가 처음 열�
 
 ### 4-2. MoveIt 경로계획 (시뮬레이션)
 
+현재 `feat/teleop-keyboard` 브랜치의 검증 대상은 5축 키보드 텔레옵입니다. 5축 CAD URDF가 갱신되면서 MoveIt 설정(`robot_arm_moveit_config`)은 최신 URDF와 다를 수 있으므로, 이 브랜치에서 PR 전 필수 검증 대상으로 보지 않습니다.
+
+### 4-3. 5축 키보드 텔레옵
+
+하드웨어 없이 RViz에서 목표 관절 상태를 확인하거나, U2D2/Dynamixel을 연결해 실제 서보를 조작하는 텔레옵 경로입니다.
+
+#### 터미널 1 — 빌드/URDF 확인
+
 ```bash
 # 컨테이너 안에서
 cd /root/ros2_ws
-colcon build --packages-select robot_arm_description robot_arm_moveit_config
+source /opt/ros/humble/setup.bash
+colcon build --packages-select robot_arm_description dynamixel_control
 source install/setup.bash
-ros2 launch robot_arm_moveit_config demo.launch.py
+check_urdf src/robot_arm_description/urdf/robot_arm.urdf
 ```
 
-RViz **MotionPlanning** 패널에서 목표 자세를 정하고 **Plan & Execute**하면 경로가 계산·실행됩니다.
-현재는 mock(가상) 하드웨어라 **실제 서보는 움직이지 않고** 시뮬상 관절만 동작합니다.
+#### 터미널 2 — RViz 텔레옵 스택
 
-- Planning Group: `arm`(팔, base_link→link_6) / `gripper`(손가락)
-- 목표 지정: 말단 마커 드래그 / Joints 탭 슬라이더 / Goal State 드롭다운(`home`, `<random valid>`)
-- 마커가 빨간색 = IK 해 없음 또는 충돌 → 도달 가능 범위로 이동
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 launch dynamixel_control teleop.launch.py rviz:=true
+```
 
-### 4-3. YOLO 카메라-Dynamixel 추적 파이프라인
+실서보까지 움직일 때만 아래처럼 실행합니다. `moveit_dynamixel_bridge`와 동시에 실행하지 마세요.
+
+```bash
+ros2 launch dynamixel_control teleop.launch.py use_hardware:=true rviz:=true
+```
+
+#### 터미널 3 — 키보드 입력
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 run dynamixel_control keyboard_teleop
+```
+
+키 조작:
+
+| 키 | 동작 |
+| --- | --- |
+| `1`~`5` | 조작할 관절 선택 |
+| `w` / `↑` | 선택 관절 + 방향 이동 |
+| `s` / `↓` | 선택 관절 - 방향 이동 |
+| `[` / `]` | 이동량 감소 / 증가 |
+| `h` | 홈(0 rad) 복귀 |
+| `space` | 현재 위치 고정 |
+| `q` | 종료 |
+
+#### 터미널 4 — joint state 확인
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 topic echo /joint_states
+```
+
+#### 터미널 5 — Dynamixel 목표 tick 확인
+
+```bash
+cd /root/ros2_ws
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 topic echo /dynamixel/goal_position
+```
+
+#### 기본 회전 제한
+
+RViz 시뮬레이션과 실서보 텔레옵은 같은 제한을 사용합니다.
+
+| 관절 | 제한(rad) | 비고 |
+| --- | --- | --- |
+| `joint_1` | `-3.141593` ~ `3.141593` | 베이스 회전, 전선 꼬임 방지 |
+| `joint_2` | `-3.141593` ~ `0.0` | URDF limit 기준 |
+| `joint_3` | `0.0` ~ `3.141593` | URDF limit 기준 |
+| `joint_4` | `-1.570796` ~ `1.570796` | URDF limit 기준 |
+| `joint_5` | `-3.141593` ~ `3.141593` | 손목 회전, 전선 꼬임 방지 |
+
+실서보 테스트는 먼저 `[`를 여러 번 눌러 step을 줄인 뒤 관절을 하나씩 확인하세요.
+
+### 4-4. YOLO 카메라-Dynamixel 추적 파이프라인
 
 USB 카메라로 스마트폰을 감지하고 Dynamixel 모터가 카메라를 추적하는 파이프라인입니다.
 
@@ -301,14 +371,14 @@ git push -u origin feat/vision  # 이후 GitHub에서 PR
 
 CAD에서 새 URDF·mesh를 가져온 뒤, 커밋 전에 아래 4단계로 검증합니다.
 
-> **현재 구성** — 실물 STL mesh 적용, 활성 관절 3개(`joint_1` ~ `joint_3`), 엔드이펙터 `Link4_1_1`
+> **현재 구성** — 2026-07-07 CAD export 기반 5축 STL mesh 적용, 활성 관절 `joint_1` ~ `joint_5`, 엔드이펙터 `module_connector_5axis_Component41_1`
 
 ### 8-1. 빌드
 
 ```bash
 # 컨테이너 안에서
 cd /root/ros2_ws
-colcon build --packages-select robot_arm_description robot_arm_moveit_config dynamixel_control
+colcon build --packages-select robot_arm_description dynamixel_control
 source install/setup.bash
 ```
 
@@ -343,31 +413,36 @@ RViz가 열리면 한 번만 아래를 설정합니다:
 **확인 포인트**
 
 - 로봇이 STL 실물 형상(회색)으로 보이는지
-- joint_state_publisher_gui 슬라이더로 `joint_1` / `joint_2` / `joint_3` 를 움직이면 해당 관절만 반응하는지
+- joint_state_publisher_gui 슬라이더 또는 텔레옵으로 `joint_1` ~ `joint_5` 를 움직이면 해당 관절만 반응하는지
+- `joint_1`/`joint_5`는 `±π`, `joint_2`는 `[-π,0]`, `joint_3`은 `[0,π]`, `joint_4`는 `±π/2` 제한 안에서만 움직이는지
 - 빨간 에러 없이 모든 링크가 렌더링되는지
 
-### 8-4. MoveIt mock demo (경로 계획)
+### 8-4. 5축 텔레옵 제한 검증
 
 ```bash
-ros2 launch robot_arm_moveit_config demo.launch.py
+# 터미널 1
+ros2 launch dynamixel_control teleop.launch.py rviz:=true
+
+# 터미널 2
+ros2 run dynamixel_control keyboard_teleop
+
+# 터미널 3
+ros2 topic echo /joint_states
 ```
 
 **확인 포인트**
 
-- 터미널 로그에서 `arm_controller`, `joint_state_broadcaster` 가 `active` 상태인지 확인
-- MotionPlanning 패널 → Planning Group `arm` → **Goal State: random valid** → **Plan** 클릭 → 궤적 애니메이션이 나오는지
-- **Execute** 후 joint_states 토픽에 `joint_1` ~ `joint_3` 만 발행되는지
-
-```bash
-# 별도 터미널에서
-ros2 topic echo /joint_states
-```
+- `keyboard_teleop`에서 `1`~`5` 선택이 되는지
+- `w`/`s` 입력에 따라 RViz와 `/joint_states`가 함께 변하는지
+- 제한에 도달한 관절은 같은 방향으로 더 눌러도 값이 더 커지거나 작아지지 않는지
+- 실서보 모드(`use_hardware:=true`)에서는 `/dynamixel/goal_position` tick도 같은 제한에서 멈추는지
 
 ### 트러블슈팅
 
 | 증상 | 원인 | 조치 |
 |------|------|------|
 | 링크가 빨간색으로 표시됨 | mesh STL 파일 경로 불일치 | `ls install/.../meshes/` 로 파일명 확인 |
-| IK 해 없음 | `joint_1`이 `continuous` 타입 | URDF에서 `revolute` + `<limit>` 추가 고려 |
-| 컨트롤러가 inactive | `ros2_controllers.yaml` 관절명 불일치 | `ros2 control list_controllers` 로 상태 확인 |
+| 텔레옵 입력은 되는데 RViz가 안 움직임 | `/joint_states` 또는 TF 갱신 문제 | `ros2 topic echo /joint_states` 로 값 변화 확인 |
+| 제한에 걸리지 않음 | 오래된 빌드/소싱 사용 | `colcon build --packages-select robot_arm_description dynamixel_control` 후 `source install/setup.bash` |
+| 실서보가 안 움직임 | `/dev/ttyUSB0` 미연결 또는 bus 충돌 | `use_hardware:=true` 실행 전 `moveit_dynamixel_bridge` 종료 |
 | RobotModel이 안 보임 | Durability 설정 누락 | RViz에서 `Transient Local` 로 변경 |
