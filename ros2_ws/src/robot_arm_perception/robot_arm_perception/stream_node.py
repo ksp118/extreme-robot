@@ -5,7 +5,7 @@ image_topic(기본 /perception/raw_image, YOLO/오버레이와 무관한 raw 프
 H.264/SRT 로 송신한다. PC 에서 power-train-sw/scripts/recv_stream.sh <port> <JetsonIP>
 로 수신.
 
-2026-07-13 파워트레인 "계약 v2"(Notion `2026 국방로봇 자율주행 SW 전체 개발계획` §7.1
+2026-07-13 파워트레인 "계약 v2"(Notion `자율주행 SW 개발계획` §7.1
 Task6/§15) 반영 — 포트 배정: L515 :5000, **D435i raw :5002**(본 노드 기본값),
 D435i YOLO metadata UDP :5003(별도, `metadata_sender_node`). 기존 기본 포트 5000은
 L515와 충돌해 5002로 변경.
