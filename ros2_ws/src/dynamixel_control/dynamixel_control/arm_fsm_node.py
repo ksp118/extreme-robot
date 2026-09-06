@@ -392,7 +392,7 @@ class ArmFsmNode(Node):
         self.declare_parameter('gripper_change_mode', False)
         self.declare_parameter('gripper_disabled', False)
         self.declare_parameter(
-            'gripper_command_calibrated', gpreset['command_calibrated'])
+            'gripper_command_calibrated', gpreset.get('command_calibrated', False))
         self.declare_parameter('stop_after_descend', False)
         self.declare_parameter('arm_move_speed', 0.5)   # [rad/s] 직접명령 시 소요시간 추정용
         # 그리퍼 — gripper_type 이 gripper_presets.GRIPPER_PRESETS 의 기본값을 고르고,

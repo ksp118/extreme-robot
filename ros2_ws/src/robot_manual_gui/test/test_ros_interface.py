@@ -4,6 +4,8 @@ from pathlib import Path
 import os
 from types import SimpleNamespace
 
+import pytest
+
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 
@@ -107,6 +109,7 @@ def _window(scope):
         request_mode=lambda _mode: None, jog_arm=lambda *_args: None,
         command_arm=lambda *_args: None,
         command_gripper=lambda position: (goals.append(position) or True),
+        command_tool_fsm=lambda command: (goals.append(command) or True),
         stop_gripper=lambda: None, command_cleaner=lambda *_args: None,
         emergency_stop=lambda: None, tool_detached=lambda: None,
         set_dual_motor_enabled=lambda *_args: True,
@@ -129,10 +132,99 @@ def _ready_status(scope):
         'actuators_discovered': True, 'motion_allowed': True,
         'read_only': False, 'emergency_stop': False, 'tool_detached': False,
         'bridge_connected': True,
+        'fsm_state': 'READY',
+        'endpoint_calibration_verified': True,
+        'synchronization': {
+            'state': 'SYNCHRONIZED', 'spread': 0.0, 'limit': 0.05},
         'dual_calibration': {'state': 'RECALIBRATION_REQUIRED', 'active': False},
         'actuators': [
             {'id': 3, 'online': True, 'position': 265, 'effort': 10},
             {'id': 4, 'online': True, 'position': 1612, 'effort': 10}]}
+
+
+def test_dual_open_close_use_fsm_ingress_only_when_all_gates_are_ready():
+    _app, window, commands = _window('END_EFFECTOR_ONLY')
+    status = _ready_status('END_EFFECTOR_ONLY')
+    status['dual_calibration'] = {'state': 'READY', 'active': False}
+    for sample in status['actuators']:
+        sample.update(torque_state='ON', hardware_error=0)
+    window._update_tool_status(status)
+    window._update_mode('MANUAL')
+    assert window.open_button.isEnabled()
+    assert window.close_button.isEnabled()
+    window._command_tool('OPEN')
+    window._command_tool('CLOSE')
+    assert commands == ['OPEN', 'CLOSE']
+    window.close()
+
+
+def test_dual_hold_buttons_use_endpoint_jog_without_calibration():
+    _app, window, commands = _window('END_EFFECTOR_ONLY')
+    status = _ready_status('END_EFFECTOR_ONLY')
+    status['dual_calibration'] = {'state': 'READY', 'active': False}
+    for sample in status['actuators']:
+        sample.update(torque_state='ON', hardware_error=0)
+    window._update_tool_status(status)
+    window._update_mode('MANUAL')
+    calibration_calls = []
+    window.node.command_dual_calibration = (
+        lambda command, **values:
+        (calibration_calls.append((command, values)) or True))
+    window._start_dual_hold_jog('OPEN')
+    assert window.dual_hold_jog_active
+    assert commands == ['JOG_OPEN']
+    assert calibration_calls == []
+    window._release_dual_hold_jog()
+    assert calibration_calls == []
+    assert commands == ['JOG_OPEN', 'HOLD']
+    assert not window.dual_hold_jog_active
+    window.close()
+
+
+def test_dual_arrow_hold_uses_endpoint_jog_and_release_hold():
+    _app, window, _commands = _window('END_EFFECTOR_ONLY')
+    calls = []
+    window.node.command_dual_calibration = (
+        lambda command, **values: (calls.append((command, values)) or True))
+    status = _ready_status('END_EFFECTOR_ONLY')
+    status['dual_calibration'] = {'state': 'READY', 'active': False}
+    for sample in status['actuators']:
+        sample.update(torque_state='ON', hardware_error=0)
+    window._update_tool_status(status)
+    window._update_mode('MANUAL')
+    window._start_dual_key_jog(1)
+    assert _commands == ['JOG_OPEN']
+    assert calls == []
+    window._stop_dual_key_jog()
+    assert _commands[-1] == 'HOLD'
+    assert not window.dual_key_jog_timer.isActive()
+    window.close()
+
+
+@pytest.mark.parametrize('mutation', ('offline', 'hardware_error', 'torque_off',
+                                      'calibration_invalid', 'sync_fault'))
+def test_dual_motion_buttons_fail_closed(mutation):
+    _app, window, _commands = _window('END_EFFECTOR_ONLY')
+    status = _ready_status('END_EFFECTOR_ONLY')
+    status['dual_calibration'] = {'state': 'READY', 'active': False}
+    for sample in status['actuators']:
+        sample.update(torque_state='ON', hardware_error=0)
+    if mutation == 'offline':
+        status['actuators'][1]['online'] = False
+    elif mutation == 'hardware_error':
+        status['actuators'][0]['hardware_error'] = 4
+    elif mutation == 'torque_off':
+        status['actuators'][1]['torque_state'] = 'OFF'
+    elif mutation == 'calibration_invalid':
+        status['endpoint_calibration_verified'] = False
+    elif mutation == 'sync_fault':
+        status['synchronization'] = {
+            'state': 'FAULT', 'spread': 0.1, 'limit': 0.05}
+    window._update_tool_status(status)
+    window._update_mode('MANUAL')
+    assert not window.open_button.isEnabled()
+    assert not window.close_button.isEnabled()
+    window.close()
 
 
 def test_end_effector_scope_enables_only_tool_controls():
@@ -169,4 +261,60 @@ def test_jog_interpolates_both_motors_and_busy_blocks_queue():
     window.gripper_busy = True
     window._jog_gripper(1)
     assert goals == []
+    window.close()
+
+
+@pytest.mark.parametrize('finish', ('release', 'close', 'deactivate', 'stop'))
+def test_hold_close_button_stops_timer_and_holds(finish):
+    from PyQt5.QtCore import QEvent
+    _app, window, commands = _window('END_EFFECTOR_ONLY')
+    status = _ready_status('END_EFFECTOR_ONLY')
+    status['dual_calibration'] = {'state': 'READY', 'active': False}
+    for sample in status['actuators']:
+        sample.update(torque_state='ON', hardware_error=0)
+    window._update_tool_status(status)
+    window._update_mode('MANUAL')
+    window.hold_close_button.pressed.emit()
+    window._dual_key_jog_tick()
+    assert commands == ['JOG_CLOSE', 'JOG_CLOSE']
+    if finish == 'release':
+        window.hold_close_button.released.emit()
+    elif finish == 'close':
+        window.close()
+    elif finish == 'deactivate':
+        window.eventFilter(window, QEvent(QEvent.WindowDeactivate))
+    else:
+        window._stop_tool()
+    assert 'HOLD' in commands
+    assert not window.dual_key_jog_timer.isActive()
+    before = list(commands)
+    window._dual_key_jog_tick()
+    assert commands == before
+    window.close()
+
+
+def test_korean_display_preserves_protocol_values():
+    from PyQt5.QtWidgets import QLabel, QPushButton, QGroupBox
+    import re
+    _app, window, commands = _window('END_EFFECTOR_ONLY')
+    status = _ready_status('END_EFFECTOR_ONLY')
+    status['dual_calibration'] = {'state': 'READY', 'active': False}
+    for sample in status['actuators']:
+        sample.update(torque_state='ON', hardware_error=0)
+    window._update_tool_status(status)
+    window._update_mode('MANUAL')
+    assert window.hold_open_button.text() == '누르는 동안 열기'
+    assert window.hold_close_button.text() == '누르는 동안 닫기'
+    assert window.tool_combo.currentData() == 'dual_motor_gripper'
+    assert window.tool_combo.currentText() == '2모터 그리퍼'
+    requests = []
+    window.node.request_mode = requests.append
+    window.mode_combo.setCurrentIndex(window.mode_combo.findData('MANUAL'))
+    window._request_mode()
+    assert requests == ['MANUAL']
+    assert window.control_mode == 'MANUAL'
+    assert window.fsm_state == 'READY'
+    for widget in window.findChildren((QLabel, QPushButton, QGroupBox)):
+        text = widget.title() if isinstance(widget, QGroupBox) else widget.text()
+        assert not re.search('[A-Za-z]', text), text
     window.close()

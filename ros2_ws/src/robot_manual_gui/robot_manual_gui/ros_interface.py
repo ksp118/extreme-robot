@@ -205,15 +205,22 @@ class ManualGuiNode(Node):
         self.command_calibration(command)
         return True
 
-    def command_spur_fsm(self, command):
+    def command_tool_fsm(self, command):
         if self.read_only:
             self.signals.log.emit('FSM command blocked: GUI is read-only')
             return False
-        if (self.selected_tool != 'spur_1motor_gripper'
+        if (self.selected_tool not in (
+                    'spur_1motor_gripper', 'dual_motor_gripper')
                 or self.control_scope != 'END_EFFECTOR_ONLY'):
             return False
         self.fsm_command_pub.publish(String(data=str(command).upper()))
         return True
+
+    def command_spur_fsm(self, command):
+        """Compatibility name retained for existing ID5 GUI/tests."""
+        if self.selected_tool != 'spur_1motor_gripper':
+            return False
+        return self.command_tool_fsm(command)
 
     def command_calibration(self, command, **values):
         if self.read_only:
