@@ -32,6 +32,7 @@ from dynamixel_control.dual_manual_recovery import (
     DualManualRecovery, DualManualRecoveryError)
 from dynamixel_control.dual_calibration_session import (
     DualCalibrationSession, DualCalibrationError)
+from dynamixel_control.tool_fsm.base import ToolState
 
 ADDR_TORQUE_ENABLE = 64
 ADDR_OPERATING_MODE = 11
@@ -431,6 +432,9 @@ class MoveItDynamixelBridge(Node):
         self.read_only = bool(self.get_parameter("read_only").value)
         self.mock_mode = bool(self.get_parameter("mock_mode").value)
         self.tool_type = str(self.get_parameter("tool_type").value)
+        self._tool_change_lock = threading.Lock()
+        self._tool_change_pending = None
+        self._tool_change_error = ''
         self.control_scope = validate_control_scope(
             self.get_parameter("control_scope").value)
         # The isolated end-effector stack must never poll or command arm IDs.
@@ -579,9 +583,12 @@ class MoveItDynamixelBridge(Node):
         if self.mock_mode:
             # Provide a deterministic, in-range feedback sample so the GUI can
             # capture its zero/reference without touching a serial device.
-            seed_tick = 3320
             joint_names = self.tool_profile.get('joint_names') or ['']
             for dxl_id in self.tool_ids:
+                endpoints = self.tool_profile.get('motor_endpoints') or {}
+                endpoint = endpoints.get(dxl_id, endpoints.get(str(dxl_id)))
+                seed_tick = (int(round((endpoint['open'] + endpoint['close']) / 2))
+                             if endpoint else 3320)
                 self._tool_samples[dxl_id] = {
                     'id': dxl_id, 'joint': joint_names[0],
                     'position': seed_tick, 'effort': 0.0, 'online': True,
@@ -625,14 +632,15 @@ class MoveItDynamixelBridge(Node):
         self.calibration_session = None
         self.dual_manual_recovery = None
         self.dual_calibration_session = None
-        if self.tool_type == 'spur_1motor_gripper' and self.tool_manager:
+        if self.tool_type in ('spur_1motor_gripper', 'dual_motor_gripper') \
+                and self.tool_manager:
             self.tool_fsm = self.tool_manager.create_fsm(self)
             self.tool_fsm.startup()
             # Startup validation is read-only.  Preserve its actual ID5
             # observations for status even when the regular SyncRead path is
             # unavailable, rather than substituting torque ownership cache.
             snapshot = getattr(self.tool_fsm, 'snapshot', None)
-            if isinstance(snapshot, dict):
+            if self.tool_type == 'spur_1motor_gripper' and isinstance(snapshot, dict):
                 self._tool_samples[5] = {
                     'id': 5,
                     'joint': (self.tool_profile.get('joint_names') or [''])[0],
@@ -643,8 +651,10 @@ class MoveItDynamixelBridge(Node):
                     'hardware_error': snapshot.get('hardware_error'),
                     'model': snapshot.get('model'),
                 }
-            self.calibration_session = CalibrationSession(self, self.tool_profile)
-        elif self.tool_type == 'dual_motor_gripper':
+            if self.tool_type == 'spur_1motor_gripper':
+                self.calibration_session = CalibrationSession(
+                    self, self.tool_profile)
+        if self.tool_type == 'dual_motor_gripper':
             self.dual_manual_recovery = DualManualRecovery(self)
             self.dual_calibration_session = DualCalibrationSession(
                 self, self.tool_profile)
@@ -677,6 +687,8 @@ class MoveItDynamixelBridge(Node):
             self.torque_request_callback, 10)
         self.fsm_command_sub = self.create_subscription(
             String, '/tool/fsm_command', self.fsm_command_callback, 10)
+        self.tool_change_sub = self.create_subscription(
+            String, '/tool/change', self.tool_change_callback, 10)
         self.calibration_command_sub = self.create_subscription(
             String, '/tool/calibration_command',
             self.calibration_command_callback, 10)
@@ -875,6 +887,19 @@ class MoveItDynamixelBridge(Node):
             self.get_logger().warn(
                 'torque enable rejected: emergency stop or tool-detached latch is active')
             return
+        if enable and self.tool_type == 'dual_motor_gripper':
+            samples = [self._tool_samples.get(dxl_id, {}) for dxl_id in (3, 4)]
+            dual_enable_ready = (
+                ids == [3, 4] and self.control_scope == 'END_EFFECTOR_ONLY'
+                and self._tool_enable_allowed()
+                and all(sample.get('online')
+                        and sample.get('hardware_error') == 0
+                        and sample.get('position') is not None
+                        for sample in samples))
+            if not dual_enable_ready:
+                self.get_logger().warn(
+                    'dual torque enable rejected: profile/scope/online/HW gate closed')
+                return
         if self.mock_mode:
             # Mock must exercise the same explicit-enable state machine, while
             # remaining strictly free of serial/register writes.
@@ -886,6 +911,8 @@ class MoveItDynamixelBridge(Node):
                 self.torque_enabled_ids.update(ids)
             else:
                 self.torque_enabled_ids.difference_update(ids)
+            for dxl_id in ids:
+                self._tool_samples[dxl_id]['torque_state'] = 'ON' if enable else 'OFF'
             self.get_logger().info(
                 f"Mock torque {'enabled' if enable else 'disabled'}: ID {ids}")
             return
@@ -913,8 +940,9 @@ class MoveItDynamixelBridge(Node):
                         self.port_handler, dxl_id, ADDR_GOAL_POSITION, pos)
                 else:
                     self.get_logger().error(
-                        f"ID {dxl_id} 현재 위치를 못 읽어 goal 동기화를 건너뜁니다 — "
-                        "토크 인가 시 팔이 옛 목표로 튈 수 있습니다")
+                        f"ID {dxl_id} 현재 위치를 못 읽어 토크 인가를 거부합니다")
+                    failed.append(dxl_id)
+                    continue
             result, error = self.packet_handler.write1ByteTxRx(
                 self.port_handler, dxl_id, ADDR_TORQUE_ENABLE,
                 TORQUE_ENABLE if enable else TORQUE_DISABLE)
@@ -932,6 +960,13 @@ class MoveItDynamixelBridge(Node):
             self.get_logger().warn(f"토크 {word}: ID {applied}")
         if failed:
             self.get_logger().error(f"토크 {word} 실패: ID {failed}")
+            if enable and self.tool_type == 'dual_motor_gripper':
+                # A partial dual enable is unsafe: make the pair torque-free.
+                for dxl_id in applied:
+                    self.packet_handler.write1ByteTxRx(
+                        self.port_handler, dxl_id, ADDR_TORQUE_ENABLE,
+                        TORQUE_DISABLE)
+                    self.torque_enabled_ids.discard(dxl_id)
 
     def _prepare_dual_gripper_enable(self, dxl_id):
         """Apply only validated dual RAM profile on an explicit enable request.
@@ -950,6 +985,12 @@ class MoveItDynamixelBridge(Node):
         velocity = int(self.tool_profile['profile_velocity'])
         goal_pwm = int(self.tool_profile['goal_pwm'])
         with self._bus_lock:
+            hardware_error, comm, packet_error = \
+                self.packet_handler.read1ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_HARDWARE_ERROR_STATUS)
+            if comm != 0 or packet_error != 0 or hardware_error != 0:
+                raise RuntimeError(
+                    f'hardware error preflight failed: {hardware_error}')
             torque, comm, packet_error = self.packet_handler.read1ByteTxRx(
                 self.port_handler, dxl_id, ADDR_TORQUE_ENABLE)
             if comm != 0 or packet_error != 0 or torque != TORQUE_DISABLE:
@@ -977,15 +1018,28 @@ class MoveItDynamixelBridge(Node):
                     raise RuntimeError(f'{label} readback failed: {actual} != {value}')
 
     def fsm_command_callback(self, msg):
-        """Normal spur commands enter only the selected single-motor FSM."""
-        if self.tool_type != 'spur_1motor_gripper' or self.tool_fsm is None:
-            self.get_logger().warn('tool FSM command rejected for non-spur tool')
+        """Route normal OPEN/CLOSE/STOP only to the selected tool FSM."""
+        if self.tool_fsm is None or self.tool_type not in (
+                'spur_1motor_gripper', 'dual_motor_gripper'):
+            self.get_logger().warn('tool FSM command rejected: no gripper FSM')
+            return
+        command = str(msg.data).strip().upper()
+        stopping = command in ('STOP', 'DISABLE')
+        if self.read_only:
+            self.get_logger().warn('tool FSM command rejected: bridge is read-only')
+            return
+        if (not stopping and (
+                self.control_scope != 'END_EFFECTOR_ONLY'
+                or self.control_mode != 'MANUAL'
+                or self.emergency_stop_active or self.tool_detached)):
+            self.get_logger().warn('tool FSM command rejected by ingress safety gate')
             return
         try:
-            state = self.tool_fsm.command(msg.data)
-            self.get_logger().info(f'spur FSM command {msg.data!r} -> {state.name}')
+            state = self.tool_fsm.command(command)
+            self.get_logger().info(
+                f'{self.tool_type} FSM command {msg.data!r} -> {state.name}')
         except Exception as exc:  # command rejection makes no register write
-            self.get_logger().warn(f'spur FSM command rejected: {exc}')
+            self.get_logger().warn(f'tool FSM command rejected: {exc}')
 
     def manual_recovery_callback(self, msg):
         """Manual dual resync ingress; never participates in OPEN/CLOSE policy."""
@@ -1028,6 +1082,10 @@ class MoveItDynamixelBridge(Node):
             elif command == 'jog_motor_degrees':
                 session.jog_motor_degrees(
                     request['actuator_id'], request['delta_deg'])
+            elif command == 'jog_pair_degrees':
+                session.jog_pair_degrees(request['delta_deg'])
+            elif command == 'hold':
+                session.hold()
             elif command == 'capture_open':
                 session.capture_open()
             elif command == 'capture_close':
@@ -1147,6 +1205,58 @@ class MoveItDynamixelBridge(Node):
         return self.dual_manual_recovery.jog(
             dxl_id, delta_deg, allowed_degrees=session.ALLOWED_DEGREES,
             goal_writer=self.dual_calibration_goal_position)
+
+    def dual_calibration_pair_jog(self, delta_deg):
+        """Paired variant of the existing witnessed calibration jog."""
+        session = self.dual_calibration_session
+        if self.read_only or session is None or not session.active:
+            raise RuntimeError('dual calibration pair jog is unavailable')
+        delta_tick = int(round(float(delta_deg) * 4096 / 360.0))
+        if delta_tick == 0:
+            raise RuntimeError('dual calibration pair jog produced zero ticks')
+        state = self.read_dual_calibration_state()
+        targets = {
+            dxl_id: int(state[dxl_id]['position']) + delta_tick
+            for dxl_id in (3, 4)}
+        self.get_logger().info(
+            f'dual calibration pair jog: delta_deg={delta_deg:+.1f}, '
+            f'present={{3: {state[3]["position"]}, 4: {state[4]["position"]}}}, '
+            f'targets={targets}')
+        with self._bus_lock:
+            self.group_sync_write.clearParam()
+            try:
+                for dxl_id in (3, 4):
+                    data = self.int_to_little_endian_4bytes(targets[dxl_id])
+                    if not self.group_sync_write.addParam(dxl_id, data):
+                        raise RuntimeError(
+                            f'ID{dxl_id} calibration pair staging failed')
+                result = self.group_sync_write.txPacket()
+                if result != 0:
+                    raise RuntimeError(
+                        f'dual calibration pair GroupSyncWrite failed: {result}')
+            finally:
+                self.group_sync_write.clearParam()
+        return targets
+
+    def dual_calibration_hold(self):
+        """Read both motors and replace pending calibration goals with HOLD."""
+        session = self.dual_calibration_session
+        if self.read_only or session is None or not session.active:
+            raise RuntimeError('dual calibration hold is unavailable')
+        positions = {}
+        with self._bus_lock:
+            for dxl_id in (3, 4):
+                positions[dxl_id] = self._read_register(
+                    dxl_id, ADDR_PRESENT_POSITION, 4,
+                    'dual calibration hold position', signed=True)
+            for dxl_id in (3, 4):
+                self._write_register(
+                    dxl_id, ADDR_GOAL_POSITION, 4,
+                    int(positions[dxl_id]) & 0xffffffff,
+                    'dual calibration hold goal')
+        self.get_logger().info(
+            f'dual calibration HOLD: present/targets={positions}')
+        return positions
 
     def read_manual_position(self, dxl_id):
         self._manual_recovery_id_allowed(dxl_id)
@@ -1471,6 +1581,24 @@ class MoveItDynamixelBridge(Node):
         self._write_register(dxl_id, ADDR_GOAL_POSITION, 4,
                              int(tick) & 0xffffffff, 'FSM goal position')
 
+    def command_dual_targets(self, targets):
+        """Synchronously dispatch and supervise one FSM endpoint command."""
+        return self._command_dual_targets_impl(targets)
+
+    def start_dual_jog(self, targets):
+        """Start endpoint-directed motion; GUI release must call HOLD."""
+        self._validate_dual_motion_request(targets)
+        self._dispatch_dual_sync_targets(targets)
+
+    def hold_dual_position(self):
+        """Stop a hold-to-run jog by making fresh positions the new goals."""
+        positions = {}
+        with self._bus_lock:
+            for dxl_id in (3, 4):
+                positions[dxl_id] = self._read_tool_state(dxl_id)[0]
+        self._validate_dual_motion_request(positions, require_range=False)
+        self._dispatch_dual_sync_targets(positions)
+
     def set_torque(self, dxl_id, enabled):
         self._fsm_id_allowed(dxl_id)
         if self.read_only:
@@ -1478,10 +1606,18 @@ class MoveItDynamixelBridge(Node):
         if self.mock_mode:
             self._tool_samples[int(dxl_id)]['torque_state'] = (
                 'ON' if enabled else 'OFF')
+            if enabled:
+                self.torque_enabled_ids.add(int(dxl_id))
+            else:
+                self.torque_enabled_ids.discard(int(dxl_id))
             return
         self._write_register(dxl_id, ADDR_TORQUE_ENABLE, 1,
                              TORQUE_ENABLE if enabled else TORQUE_DISABLE,
                              'FSM torque')
+        if enabled:
+            self.torque_enabled_ids.add(int(dxl_id))
+        else:
+            self.torque_enabled_ids.discard(int(dxl_id))
 
     def _discover_tool_ids(self):
         """Ping every configured actuator; any missing ID closes the backend."""
@@ -1541,6 +1677,9 @@ class MoveItDynamixelBridge(Node):
                     self.port_handler, dxl_id, ADDR_GOAL_VELOCITY, 0)
                 self.packet_handler.write1ByteTxRx(
                     self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+        tool_fsm = getattr(self, 'tool_fsm', None)
+        if tool_fsm is not None:
+            tool_fsm.state = ToolState.STOPPED
         self.get_logger().warn(f'tool actuator stopped: {reason}')
 
     def _on_emergency_stop(self, msg):
@@ -1572,6 +1711,120 @@ class MoveItDynamixelBridge(Node):
         except Exception as exc:  # pragma: no cover - hardware/runtime guard
             self.get_logger().error(f'/tool/status publish failed: {exc}')
 
+    def tool_change_callback(self, msg):
+        """Rebuild the selected gripper profile and FSM without restarting ROS."""
+        requested = str(msg.data).strip()
+        with self._tool_change_lock:
+            self._tool_change_pending = requested
+            self._tool_change_error = ''
+            try:
+                self._switch_tool_runtime(requested)
+            except Exception as exc:
+                self._tool_change_error = str(exc)
+                self.get_logger().error(f'runtime tool change rejected: {exc}')
+            finally:
+                self._tool_change_pending = None
+
+    def _switch_tool_runtime(self, requested):
+        supported = ('spur_1motor_gripper', 'dual_motor_gripper', 'cleaner')
+        if requested not in supported:
+            raise ToolProfileError(
+                f'runtime switching supports only {supported}, got {requested!r}')
+        if requested == self.tool_type:
+            return
+        if self.emergency_stop_active or self.tool_detached:
+            raise RuntimeError('runtime tool change blocked by emergency stop or detached latch')
+        if self._gripper_goal_active:
+            raise RuntimeError('runtime tool change blocked while gripper motion is active')
+        old_fsm = self.tool_fsm
+        if old_fsm and old_fsm.state not in (
+                ToolState.READY, ToolState.OPEN, ToolState.CLOSED,
+                ToolState.CALIBRATION_REQUIRED, ToolState.STOPPED):
+            offline_safe = (old_fsm.state == ToolState.FAULT
+                            and not self.tool_discovered
+                            and not (self.torque_enabled_ids & set(self.tool_ids)))
+            if not offline_safe:
+                raise RuntimeError(
+                    f'runtime tool change unavailable in {old_fsm.state.name}')
+
+        profiles = load_profiles(self.get_parameter('tool_profile_file').value)
+        manager = ToolManager(
+            profiles, ParameterToolIdentityProvider(requested),
+            mock_mode=self.mock_mode)
+        selection = manager.refresh('IDLE')
+        new_ids = [int(item) for item in selection.profile.get('actuator_ids', [])]
+        expected_ids = {'spur_1motor_gripper': [5], 'dual_motor_gripper': [3, 4]}.get(requested, new_ids)
+        if new_ids != expected_ids:
+            raise ToolProfileError(
+                f'{requested} profile actuator_ids must be {expected_ids}, got {new_ids}')
+
+        # Stop and unregister the old tool before changing the allowlist.  This
+        # is the only deliberate hardware write in a tool-change operation.
+        old_ids = list(self.tool_ids)
+        old_torque_on = bool(self.torque_enabled_ids & set(old_ids))
+        if old_torque_on:
+            self._stop_tool(f'runtime tool change to {requested}')
+        else:
+            self.tool_motion_allowed = False
+            if old_fsm is not None:
+                old_fsm.state = ToolState.STOPPED
+        for dxl_id in old_ids:
+            try:
+                self.group_sync_read.delParam(dxl_id)
+            except Exception:
+                pass
+            self.active_ids.discard(dxl_id)
+            self.torque_enabled_ids.discard(dxl_id)
+
+        self.tool_type = requested
+        self.tool_manager = manager
+        self.tool_selection = selection
+        self.tool_profile = selection.profile
+        self.tool_ids = new_ids
+        self.tool_motion_allowed = bool(selection.valid)
+        self.tool_discovered = self.mock_mode
+        self._tool_samples = {}
+        if self.mock_mode:
+            joint_names = self.tool_profile.get('joint_names') or ['']
+            endpoints = self.tool_profile.get('motor_endpoints') or {}
+            for dxl_id in self.tool_ids:
+                endpoint = endpoints.get(dxl_id, endpoints.get(str(dxl_id)))
+                if endpoint:
+                    seed_tick = int(round((endpoint['open'] + endpoint['close']) / 2))
+                else:
+                    seed_tick = int(self.tool_profile.get('open_tick', 0))
+                self._tool_samples[dxl_id] = {
+                    'id': dxl_id, 'joint': joint_names[0],
+                    'position': seed_tick, 'effort': 0.0, 'online': True,
+                    'hardware_error': 0, 'torque_state': 'OFF'}
+        elif self.port_connected:
+            self.tool_discovered = self._discover_tool_ids()
+            if self.tool_discovered:
+                for dxl_id in self.tool_ids:
+                    self.group_sync_read.addParam(dxl_id)
+                    self.active_ids.add(dxl_id)
+        else:
+            self.tool_motion_allowed = False
+
+        self._fsm_allowlist = set()
+        # Cleaner retains the existing arm mission FSM and cleaning adapter.
+        self.tool_fsm = None
+        if requested != 'cleaner':
+            self.tool_fsm = manager.create_fsm(self)
+            self.tool_fsm.startup()
+        self.calibration_session = None
+        self.dual_manual_recovery = None
+        self.dual_calibration_session = None
+        if requested == 'spur_1motor_gripper':
+            self.calibration_session = CalibrationSession(self, self.tool_profile)
+        elif requested == 'dual_motor_gripper':
+            self.dual_manual_recovery = DualManualRecovery(self)
+            self.dual_calibration_session = DualCalibrationSession(
+                self, self.tool_profile)
+        self.get_logger().info(
+            f'runtime tool change complete: tool_type={requested}, ids={self.tool_ids}, '
+            f'fsm={self.tool_fsm.__class__.__name__}')
+
     def publish_tool_status(self):
         self.tool_type_pub.publish(String(data=self.tool_type))
         reason = ''
@@ -1587,12 +1840,33 @@ class MoveItDynamixelBridge(Node):
         fsm_fault = (self.tool_fsm.fault_reason
                      if self.tool_fsm and self.tool_fsm.state.name == 'FAULT'
                      else None)
+        synchronization = {'state': 'NOT_APPLICABLE', 'spread': None,
+                           'limit': 0.05, 'recalibration_required': False}
+        if self.tool_type == 'dual_motor_gripper':
+            positions = {dxl_id: self._tool_samples.get(dxl_id, {}).get('position')
+                         for dxl_id in (3, 4)}
+            try:
+                if any(value is None for value in positions.values()):
+                    raise RuntimeError('dual position feedback unavailable')
+                _fractions, spread = self._dual_normalized_spread(positions)
+                synchronized = spread <= 0.05
+                synchronization = {
+                    'state': 'SYNCHRONIZED' if synchronized else 'FAULT',
+                    'spread': spread, 'limit': 0.05,
+                    'recalibration_required': not synchronized}
+            except RuntimeError as exc:
+                synchronization = {
+                    'state': 'UNKNOWN', 'spread': None, 'limit': 0.05,
+                    'recalibration_required': True, 'reason': str(exc)}
         status = {
             'control_scope': self.control_scope,
             'tool_type': self.tool_type,
+            'tool_profile': self.tool_profile,
             'backend': self.tool_profile.get('backend', 'invalid'),
             'profile_valid': bool(self.tool_selection and self.tool_selection.valid),
             'calibrated': bool(self.tool_profile.get('calibrated')),
+            'endpoint_calibration_verified': bool(
+                self.tool_profile.get('endpoint_calibration_verified')),
             'temporary_jog_mode': self.temporary_jog_enabled,
             'temporary_jog_ready': self._tool_backend_ready(),
             'tool_enable_allowed': self._tool_enable_allowed(),
@@ -1633,6 +1907,12 @@ class MoveItDynamixelBridge(Node):
             'hardware_error': id5.get('hardware_error'),
             'model': id5.get('model'),
             'fault': fsm_fault,
+            'synchronization': synchronization,
+            'tool_change': {
+                'pending': self._tool_change_pending is not None,
+                'requested': self._tool_change_pending,
+                'error': self._tool_change_error,
+            },
         }
         self.tool_status_pub.publish(String(data=json.dumps(status, sort_keys=True)))
 
@@ -2154,6 +2434,9 @@ class MoveItDynamixelBridge(Node):
             return result
 
     def _read_tool_state(self, dxl_id):
+        if self.mock_mode:
+            sample = self._tool_samples[int(dxl_id)]
+            return int(sample['position']), float(sample.get('effort', 0.0))
         hw, comm, error = self.packet_handler.read1ByteTxRx(
             self.port_handler, dxl_id, ADDR_HARDWARE_ERROR_STATUS)
         load, load_comm, load_error = self.packet_handler.read2ByteTxRx(
@@ -2168,6 +2451,94 @@ class MoveItDynamixelBridge(Node):
                 f'load={(load_comm, load_error)}, '
                 f'position={(pos_comm, pos_error)}')
         return self._tool_position_tick(dxl_id, position), to_signed(load, 2)
+
+    def _command_dual_targets_impl(self, targets):
+        self._validate_dual_motion_request(targets)
+        if self.mock_mode:
+            for dxl_id, tick in targets.items():
+                self._tool_samples[dxl_id]['position'] = int(tick)
+            return
+        try:
+            self._dispatch_dual_sync_targets(targets)
+            deadline = time.monotonic() + float(
+                self.tool_profile['action_time'])
+            max_effort = float(self.tool_profile.get(
+                'max_abs_effort', float('inf')))
+            while time.monotonic() < deadline:
+                positions = {}
+                errors = {}
+                with self._bus_lock:
+                    for dxl_id in (3, 4):
+                        position, effort = self._read_tool_state(dxl_id)
+                        if abs(effort) > max_effort:
+                            raise RuntimeError(
+                                f'ID{dxl_id} effort limit exceeded')
+                        positions[dxl_id] = position
+                        errors[dxl_id] = int(targets[dxl_id]) - position
+                _fractions, spread = self._dual_normalized_spread(positions)
+                if spread > 0.05:
+                    raise RuntimeError(
+                        f'dual synchronization fault: normalized spread '
+                        f'{spread:.4f} > 0.0500; recalibration required')
+                if all(abs(error) <= self.gripper_target_tolerance
+                       for error in errors.values()):
+                    # Successful endpoint completion leaves the pair enabled
+                    # so the FSM can remain OPEN/CLOSED and hold position.
+                    self.tool_motion_allowed = True
+                    return
+                time.sleep(0.05)
+            raise RuntimeError(
+                f'dual target tolerance not reached: errors={errors}')
+        except Exception:
+            self._stop_tool('dual FSM motion fault; recalibration required')
+            raise
+
+    def _validate_dual_motion_request(self, targets, require_range=True):
+        if (self.tool_type != 'dual_motor_gripper' or self.tool_ids != [3, 4]
+                or set(targets) != {3, 4}):
+            raise RuntimeError('dual FSM target set must be exactly IDs [3, 4]')
+        if (self.control_scope != 'END_EFFECTOR_ONLY'
+                or self.control_mode != 'MANUAL'
+                or not self._tool_backend_ready()
+                or self.emergency_stop_active or self.tool_detached):
+            raise RuntimeError('dual FSM motion safety gate is not ready')
+        if require_range:
+            low = int(self.tool_profile['safe_min_tick'])
+            high = int(self.tool_profile['safe_max_tick'])
+            if any(not low <= int(tick) <= high for tick in targets.values()):
+                raise RuntimeError('dual FSM target outside calibrated safe range')
+        _fractions, spread = self._dual_normalized_spread()
+        if spread > 0.05:
+            raise RuntimeError(
+                f'dual synchronization fault: normalized spread '
+                f'{spread:.4f} > 0.0500')
+    def _dispatch_dual_sync_targets(self, targets):
+        if self.mock_mode:
+            for dxl_id, tick in targets.items():
+                self._tool_samples[dxl_id]['position'] = int(tick)
+            return
+        try:
+            with self._bus_lock:
+                self.group_sync_write.clearParam()
+                for dxl_id in (3, 4):
+                    if (self.read_hardware_error(dxl_id) != 0
+                            or self.read_torque(dxl_id) != 1):
+                        raise RuntimeError(
+                            f'ID{dxl_id} HW/torque preflight failed')
+                    data = self.int_to_little_endian_4bytes(
+                        int(targets[dxl_id]))
+                    if not self.group_sync_write.addParam(dxl_id, data):
+                        raise RuntimeError(
+                            f'ID{dxl_id} sync target staging failed')
+                result = self.group_sync_write.txPacket()
+                self.group_sync_write.clearParam()
+                if result != 0:
+                    raise RuntimeError(f'dual GroupSyncWrite failed: {result}')
+        except Exception:
+            self._stop_tool('dual FSM motion fault; recalibration required')
+            raise
+        finally:
+            self.group_sync_write.clearParam()
 
     def _dual_normalized_spread(self, positions=None):
         """Return fresh dual normalized progress and its strict spread limit.
@@ -2367,7 +2738,7 @@ class MoveItDynamixelBridge(Node):
             msg.position.append(self.tick_to_rad(joint_name, tick))
             msg.effort.append(float(feedback_raw))
 
-        if (self.cleaning_configured
+        if (self.tool_type == 'cleaner' and self.cleaning_configured
                 and self.cleaning_actuator_id in self.active_ids):
             sample = self._read_sample(self.cleaning_actuator_id)
             if sample is None:
@@ -2464,6 +2835,31 @@ class MoveItDynamixelBridge(Node):
                     'hardware_error': int(hw_error), **control}
                 gripper_samples.append(
                     (load_raw, to_signed(tick, LEN_PRESENT_POSITION), velocity_raw))
+
+            dual_driving = set(self.gripper_ids).issubset(
+                self.torque_enabled_ids)
+            if dual_driving:
+                sync_fault = None
+                if len(gripper_samples) != len(self.gripper_ids):
+                    sync_fault = 'dual feedback lost while torque enabled'
+                else:
+                    positions = {
+                        dxl_id: self._tool_samples[dxl_id]['position']
+                        for dxl_id in self.gripper_ids}
+                    try:
+                        _fractions, spread = self._dual_normalized_spread(
+                            positions)
+                        if spread > 0.05:
+                            sync_fault = (
+                                f'normalized spread {spread:.4f} > 0.0500; '
+                                'recalibration required')
+                    except RuntimeError as exc:
+                        sync_fault = str(exc)
+                if sync_fault:
+                    self._stop_tool(sync_fault)
+                    if self.tool_fsm is not None:
+                        self.tool_fsm.fault_reason = str(sync_fault)
+                        self.tool_fsm.state = ToolState.STOPPED
 
             if len(gripper_samples) == len(self.gripper_ids) and gripper_samples:
                 representative_tick = gripper_samples[0][1]

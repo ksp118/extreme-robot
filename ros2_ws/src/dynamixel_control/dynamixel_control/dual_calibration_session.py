@@ -65,6 +65,21 @@ class DualCalibrationSession:
         self._require_healthy(torque_on=True)
         return self.bridge.dual_calibration_jog(int(dxl_id), float(delta_deg))
 
+    def jog_pair_degrees(self, delta_deg):
+        """Move ID3/ID4 by one equal calibration step via a paired write."""
+        self._require_active()
+        if float(delta_deg) not in self.ALLOWED_DEGREES:
+            raise DualCalibrationError(
+                'allowed dual calibration steps are ±0.5, ±1, ±2, ±5°')
+        self._require_healthy(torque_on=True)
+        return self.bridge.dual_calibration_pair_jog(float(delta_deg))
+
+    def hold(self):
+        """Hold both fresh positions when a hold-to-run key is released."""
+        self._require_active()
+        self._require_healthy(torque_on=True)
+        return self.bridge.dual_calibration_hold()
+
     def capture_open(self):
         return self._capture('open')
 
