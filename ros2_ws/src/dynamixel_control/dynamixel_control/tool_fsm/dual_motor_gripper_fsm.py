@@ -71,8 +71,16 @@ class DualMotorGripperFSM(ToolFSM):
                 self.bridge.start_dual_jog(targets)
             else:
                 self.bridge.command_dual_targets(targets)
+            # A completed endpoint command is a parked, torque-holding state.
+            # Only explicit STOP/DISABLE or a safety/fault path may turn torque
+            # off; do not route successful OPEN/CLOSE through stop().
+            if not jog:
+                for dxl_id in self.actuator_ids:
+                    if self.bridge.read_torque(dxl_id) != 1:
+                        raise ToolCommandError(
+                            f'actual ID{dxl_id} Torque Enable dropped after command')
         except Exception as exc:
-            return self._fault(exc)
+            return self._motion_fault(exc)
         if not jog:
             self.state = ToolState.OPEN if opening else ToolState.CLOSED
         return self.state
@@ -83,8 +91,20 @@ class DualMotorGripperFSM(ToolFSM):
         try:
             self.bridge.hold_dual_position()
         except Exception as exc:
-            return self._fault(exc)
+            return self._motion_fault(exc)
         self.state = ToolState.READY
+        return self.state
+
+    def _motion_fault(self, reason):
+        """Disable the pair and leave a motion fault in the stopped state."""
+        errors = []
+        for dxl_id in self.actuator_ids:
+            try:
+                self.bridge.set_torque(dxl_id, False)
+            except Exception as exc:
+                errors.append(f'ID{dxl_id}: {exc}')
+        self.fault_reason = '; '.join(errors) if errors else str(reason)
+        self.state = ToolState.STOPPED
         return self.state
 
     def stop(self):

@@ -57,6 +57,7 @@ def test_registry_selects_dual_fsm_and_open_close_use_dual_adapter():
     assert bridge.commands[-1] == {3: 1000, 4: 2000}
     assert fsm.command('CLOSE') == ToolState.CLOSED
     assert bridge.commands[-1] == {3: 100, 4: 1100}
+    assert bridge.torque == {3: 1, 4: 1}
 
 
 @pytest.mark.parametrize('offline_id', (3, 4))

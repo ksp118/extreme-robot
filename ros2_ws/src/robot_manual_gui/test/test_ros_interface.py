@@ -26,8 +26,17 @@ def test_gui_uses_existing_control_interfaces():
     for interface in (
             '/arm_controller/joint_trajectory',
             '/gripper_controller/follow_joint_trajectory',
-            '/cleaning/enable', '/tool/emergency_stop', '/tool/detached'):
+            '/cleaning/enable', '/tool/emergency_stop', '/tool/detached',
+            '/tool/change'):
         assert interface in source
+
+
+def test_runtime_tool_change_is_published_by_gui():
+    source = (ROOT / 'ros_interface.py').read_text(encoding='utf-8')
+    window = (ROOT / 'main_window.py').read_text(encoding='utf-8')
+    assert "self.tool_change_pub = self.create_publisher(String, '/tool/change'" in source
+    assert 'def request_tool_change(self, tool_type):' in source
+    assert 'self.node.request_tool_change(requested)' in window
 
 
 def test_mode_status_does_not_overwrite_pending_operator_request():
@@ -318,3 +327,167 @@ def test_korean_display_preserves_protocol_values():
         text = widget.title() if isinstance(widget, QGroupBox) else widget.text()
         assert not re.search('[A-Za-z]', text), text
     window.close()
+
+
+def test_mock_runtime_round_trip_routes_buttons_keys_and_clears_context():
+    from PyQt5.QtCore import QEvent, Qt
+    from PyQt5.QtGui import QKeyEvent
+
+    app, window, commands = _window('END_EFFECTOR_ONLY')
+    window.mock_mode = True
+    window.node.temporary_jog_mode = False
+    window.node.command_cleaner = lambda enabled: commands.append(('cleaner', enabled))
+    window.node.command_calibration = lambda command, **values: (commands.append((command, values)) or True)
+    requests = []
+    window.node.request_tool_change = lambda tool: (requests.append(tool) or True)
+    dual_profile = dict(window.profile)
+    window._update_mode('MANUAL')
+    try:
+        for tool, ids in [('dual_motor_gripper', [3, 4]),
+                          ('spur_1motor_gripper', [5]),
+                          ('cleaner', []), ('dual_motor_gripper', [3, 4])]:
+            old_panel = window.tool_control_box
+            changed = window.node.selected_tool != tool
+            if changed:
+                window.gripper_target_ticks = {99: 123}
+                window.spur_zero_tick = 123
+                window.tool_combo.setCurrentIndex(window.tool_combo.findData(tool))
+                window._request_tool_change()
+                assert window.pending_tool_change == tool
+                assert not window.tool_control_box.isEnabled()
+            status = _ready_status('END_EFFECTOR_ONLY')
+            status.update(tool_type=tool, online=True, hardware_error=0,
+                          tool_torque_state='ON', calibration_jog_enabled=True,
+                          calibration={'active': True, 'enabled': True},
+                          dual_calibration={'state': 'READY', 'active': False})
+            profile = dual_profile if len(ids) == 2 else {
+                'actuator_ids': ids, 'calibrated': True,
+                'safe_min_tick': 2867, 'safe_max_tick': 3807,
+                'open_tick': 2867, 'close_tick': 3807}
+            status['tool_profile'] = profile
+            if ids != [3, 4]:
+                status['actuators'] = [dict(id=i, position=3300, online=True) for i in ids]
+            for sample in status['actuators']:
+                sample.update(torque_state='ON', hardware_error=0)
+            window._update_tool_status(status)
+            assert window.node.selected_tool == tool
+            assert window.node.actuator_ids == ids
+            assert window.profile is profile
+            assert window.pending_tool_change is None
+            if changed:
+                assert old_panel.isHidden() and not old_panel.isEnabled()
+                assert not window.gripper_target_ticks
+                assert window.spur_zero_tick is None
+                assert not window.dual_key_jog_timer.isActive()
+                assert not window.dual_hold_jog_active
+            commands.clear()
+            if tool == 'cleaner':
+                assert window.open_button.isHidden()
+                assert window.spur_enable.isHidden()
+                assert window.dual_enable.isHidden()
+                window.clean_start.click()
+                window.clean_stop.click()
+                window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier))
+                window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Left, Qt.NoModifier))
+                assert commands == [('cleaner', True), ('cleaner', False), ('cleaner', False)]
+                assert window.spur_actual_state is None
+                assert window.motor_minus_half is None
+            else:
+                assert window.clean_start.isHidden()
+                window.open_button.click()
+                window.close_button.click()
+                assert commands == ['OPEN', 'CLOSE']
+                commands.clear()
+                if tool == 'dual_motor_gripper':
+                    window.hold_open_button.pressed.emit()
+                    window.hold_open_button.released.emit()
+                    assert commands == ['JOG_OPEN', 'HOLD']
+                    commands.clear()
+                    window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Right, Qt.NoModifier))
+                    window.keyReleaseEvent(QKeyEvent(QEvent.KeyRelease, Qt.Key_Right, Qt.NoModifier))
+                    assert commands == ['JOG_CLOSE', 'HOLD']
+                else:
+                    window.jog_close.click()
+                    window.jog_open.click()
+                    window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Left, Qt.NoModifier))
+                    assert commands == [('jog_motor_degrees', {'delta_deg': -0.5}),
+                                        ('jog_motor_degrees', {'delta_deg': 0.5}),
+                                        ('jog_motor_degrees', {'delta_deg': -0.5})]
+                    assert not window.gripper_target_ticks
+            app.processEvents()
+        assert requests == ['spur_1motor_gripper', 'cleaner', 'dual_motor_gripper']
+    finally:
+        window.close()
+
+
+def test_rejected_change_preserves_active_context_and_resets_combo():
+    _app, window, commands = _window('END_EFFECTOR_ONLY')
+    window.node.request_tool_change = lambda _: True
+    status = _ready_status('END_EFFECTOR_ONLY')
+    status['tool_profile'] = window.profile
+    window._update_tool_status(status)
+    panel = window.tool_control_box
+    window.tool_combo.setCurrentIndex(window.tool_combo.findData('cleaner'))
+    window._request_tool_change()
+    status['tool_change'] = {'error': 'motion active'}
+    window._update_tool_status(status)
+    assert window.node.selected_tool == 'dual_motor_gripper'
+    assert window.node.actuator_ids == [3, 4]
+    assert window.tool_combo.currentData() == 'dual_motor_gripper'
+    assert window.tool_control_box is panel and panel.isEnabled()
+    assert not commands
+    window.close()
+
+
+def test_late_gripper_goal_response_cannot_restore_previous_tool_state():
+    from robot_manual_gui.ros_interface import ManualGuiNode
+    callbacks = []
+    future = SimpleNamespace(add_done_callback=callbacks.append)
+    node = SimpleNamespace(
+        selected_tool='dual_motor_gripper', read_only=False, control_mode='MANUAL',
+        gripper_busy=False, temporary_jog_mode=False, tool_context_generation=0,
+        signals=SimpleNamespace(gripper_state=SimpleNamespace(emit=lambda *_: None)),
+        get_logger=lambda: SimpleNamespace(info=lambda _: None),
+        gripper=SimpleNamespace(send_goal_async=lambda _: future),
+        _gripper_goal_response=lambda _: pytest.fail('old callback reached new tool'))
+    assert ManualGuiNode.command_gripper(node, 0.5)
+    node.selected_tool = 'cleaner'
+    node.tool_context_generation += 1
+    callbacks[0](future)
+
+
+@pytest.mark.parametrize('state,allowed', [
+    ('IDLE', True), ('STOWED', True), ('STOWED_LOCKED', True),
+    ('CALIBRATION_REQUIRED', True), ('STOPPED', True), ('READY', True),
+    ('OPENING', False), ('CLOSING', False), ('FAULT', False)])
+def test_spur_manual_ownership_safe_states(monkeypatch, state, allowed):
+    from PyQt5.QtWidgets import QMessageBox
+    _app, window, _commands = _window('END_EFFECTOR_ONLY')
+    requests, warnings = [], []
+    window.node.selected_tool = 'spur_1motor_gripper'
+    window.node.request_mode = requests.append
+    window.fsm_state = state
+    window.mode_combo.setCurrentIndex(window.mode_combo.findData('MANUAL'))
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *_: warnings.append(True))
+    window._request_mode()
+    assert requests == (['MANUAL'] if allowed else [])
+    assert bool(warnings) == (not allowed)
+    window.close()
+
+
+def test_bridge_accepts_ready_manual_request_without_motor_commands():
+    import ast
+    source = Path(__file__).parents[2] / 'dynamixel_control/dynamixel_control/moveit_dynamixel_bridge.py'
+    tree = ast.parse(source.read_text())
+    methods = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+               and node.name in ('_on_control_mode', '_on_control_mode_request')]
+    namespace = {'String': lambda **values: SimpleNamespace(**values)}
+    exec(compile(ast.Module(body=methods, type_ignores=[]), str(source), 'exec'), namespace)
+    published = []
+    bridge = SimpleNamespace(control_mode='FSM', tool_type='spur_1motor_gripper',
+                             tool_fsm=SimpleNamespace(state=SimpleNamespace(name='READY')),
+                             control_mode_status_pub=SimpleNamespace(publish=published.append))
+    bridge._on_control_mode = lambda msg: namespace['_on_control_mode'](bridge, msg)
+    namespace['_on_control_mode_request'](bridge, SimpleNamespace(data='MANUAL'))
+    assert bridge.control_mode == 'MANUAL'
+    assert published[0].data == 'MANUAL'
