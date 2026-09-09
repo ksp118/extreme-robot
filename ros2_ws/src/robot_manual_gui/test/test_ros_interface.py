@@ -490,6 +490,23 @@ def test_spur_manual_ownership_safe_states(monkeypatch, state, allowed):
     window.close()
 
 
+def test_cleaner_in_end_effector_scope_can_request_manual_ownership(monkeypatch):
+    from PyQt5.QtWidgets import QMessageBox
+    _app, window, _commands = _window('END_EFFECTOR_ONLY')
+    try:
+        requests, warnings = [], []
+        window.node.selected_tool = 'cleaner'
+        window.node.request_mode = requests.append
+        window.fsm_state = 'READY'
+        window.mode_combo.setCurrentIndex(window.mode_combo.findData('MANUAL'))
+        monkeypatch.setattr(QMessageBox, 'warning', lambda *_: warnings.append(True))
+        window._request_mode()
+        assert requests == ['MANUAL']
+        assert warnings == []
+    finally:
+        window.close()
+
+
 def test_bridge_accepts_ready_manual_request_without_motor_commands():
     import ast
     source = Path(__file__).parents[2] / 'dynamixel_control/dynamixel_control/moveit_dynamixel_bridge.py'

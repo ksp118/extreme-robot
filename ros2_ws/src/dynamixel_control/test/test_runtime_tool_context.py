@@ -18,6 +18,7 @@ def test_bridge_mock_dual_spur_cleaner_dual_reuses_existing_contexts():
     method = next(node for node in ast.walk(tree)
                   if isinstance(node, ast.FunctionDef) and node.name == '_switch_tool_runtime')
     namespace = dict(globals())
+    namespace['ARM_IDS'] = set()
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), namespace)
     profile_path = Path(__file__).parents[1] / 'config/tool_profiles.yaml'
     bridge = SimpleNamespace(
@@ -36,7 +37,7 @@ def test_bridge_mock_dual_spur_cleaner_dual_reuses_existing_contexts():
     for tool, ids, fsm_name in (
             ('dual_motor_gripper', [3, 4], 'DualMotorGripperFSM'),
             ('spur_1motor_gripper', [5], 'SingleMotorGripperFSM'),
-            ('cleaner', [], 'CleanerFSM'),
+            ('cleaner', [2], 'CleanerFSM'),
             ('dual_motor_gripper', [3, 4], 'DualMotorGripperFSM')):
         # The production switch requires the old tool to have stopped.
         if bridge.tool_fsm:
@@ -45,8 +46,20 @@ def test_bridge_mock_dual_spur_cleaner_dual_reuses_existing_contexts():
         assert bridge.tool_type == tool
         assert bridge.tool_ids == bridge.tool_profile['actuator_ids'] == ids
         assert set(bridge._tool_samples) == set(ids)
-        assert bridge._fsm_allowlist == set(ids)
+        # Cleaner uses its velocity adapter rather than the gripper FSM
+        # allowlist; its dedicated actuator ID is still in the active profile.
+        assert bridge._fsm_allowlist == (set() if tool == 'cleaner' else set(ids))
         assert (type(bridge.tool_fsm).__name__ if bridge.tool_fsm else None) == fsm_name
         assert bool(bridge.calibration_session) == (tool == 'spur_1motor_gripper')
         assert bool(bridge.dual_calibration_session) == (tool == 'dual_motor_gripper')
         assert bool(bridge.dual_manual_recovery) == (tool == 'dual_motor_gripper')
+
+
+def test_cleaner_setup_zeros_velocity_before_torque_enable():
+    source = Path(__file__).parents[1] / 'dynamixel_control/moveit_dynamixel_bridge.py'
+    text = source.read_text()
+    start = text.index('    def _configure_cleaning_actuator')
+    end = text.index('    def _cleaner_direction_command', start)
+    setup = text[start:end]
+    assert "'cleaner zero goal velocity'" in setup
+    assert setup.index("'cleaner zero goal velocity'") < setup.index('_enable_torque')

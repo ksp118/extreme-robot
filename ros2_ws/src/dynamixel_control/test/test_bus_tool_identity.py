@@ -9,7 +9,7 @@ from dynamixel_control.tool_manager import BusToolIdentityProvider
 PROFILES = {
     'dual_motor_gripper': {'actuator_ids': [3, 4]},
     'spur_1motor_gripper': {'actuator_ids': [5]},
-    'cleaner': {'actuator_ids': []},
+    'cleaner': {'actuator_ids': [2]},
 }
 
 
@@ -39,7 +39,7 @@ def _bridge(observations):
     bridge._bus_tool_identity = SimpleNamespace(
         detected_tool_type=lambda: observations.pop(0),
         supported_tool_types={
-            'dual_motor_gripper', 'spur_1motor_gripper'},
+            'cleaner', 'dual_motor_gripper', 'spur_1motor_gripper'},
         last_reason='no supported tool actuator detected')
     bridge.mock_mode = False
     bridge.port_connected = True
@@ -78,6 +78,14 @@ def test_auto_switch_requires_confirmed_detach_then_confirmed_new_tool():
     assert not bridge._physical_tool_detached
 
 
+def test_id2_cleaner_signature_switches_after_confirmed_removal():
+    bridge = _bridge([None, None, 'cleaner', 'cleaner'])
+    for _ in range(4):
+        bridge._poll_physical_tool()
+    assert bridge._switches == ['cleaner']
+    assert bridge.tool_type == 'cleaner'
+
+
 def test_different_signature_first_latches_stop_before_switching():
     bridge = _bridge(['spur_1motor_gripper', 'spur_1motor_gripper'])
     bridge._poll_physical_tool()
@@ -87,14 +95,20 @@ def test_different_signature_first_latches_stop_before_switching():
     assert bridge._physical_tool_detached
 
 
-def test_manual_detach_latch_blocks_automatic_switch():
+def test_confirmed_replacement_clears_manual_detach_latch_but_not_estop():
     bridge = _bridge([
         None, None, 'spur_1motor_gripper', 'spur_1motor_gripper'])
     bridge.tool_detached = True
     for _ in range(4):
         bridge._poll_physical_tool()
+    assert bridge._switches == ['spur_1motor_gripper']
+    assert not bridge.tool_detached
+    bridge = _bridge([None, None, 'spur_1motor_gripper', 'spur_1motor_gripper'])
+    bridge.emergency_stop_active = True
+    for _ in range(4):
+        bridge._poll_physical_tool()
     assert bridge._switches == []
-    assert bridge._physical_tool_detached
+    assert 'emergency stop' in bridge._tool_detection_reason
 
 
 def test_same_tool_reattachment_is_revalidated_without_runtime_switch():
@@ -115,13 +129,12 @@ def test_same_tool_reattachment_is_revalidated_without_runtime_switch():
     assert not bridge._physical_tool_detached
 
 
-def test_tool_without_id_signature_is_not_reported_as_detached():
-    bridge = _bridge([])
+def test_cleaner_id2_signature_is_polled_as_a_physical_tool():
+    bridge = _bridge(['cleaner'])
     bridge.tool_type = 'cleaner'
     bridge._poll_physical_tool()
     assert bridge._stops == []
     assert not bridge._physical_tool_detached
-    assert 'no physical actuator signature' in bridge._tool_detection_reason
 
 
 def test_full_robot_waits_for_safe_arm_state_before_switch():

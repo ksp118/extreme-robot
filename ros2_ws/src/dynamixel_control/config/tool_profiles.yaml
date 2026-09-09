@@ -49,9 +49,11 @@ tool_profiles:
 
   cleaner:
     backend: cleaner
-    calibrated: false
-    actuator_ids: []
-    joint_names: []
-    direction: null
-    profile_velocity: null
-    profile_acceleration: null
+    # Physical cleaner attached during the ID2 hot-swap validation.  It has no
+    # arm-ID overlap; its direction is exposed as LEFT/RIGHT in the GUI.
+    calibrated: true
+    actuator_ids: [2]
+    joint_names: [cleaner_drive_joint]
+    direction: 1
+    profile_velocity: 20
+    profile_acceleration: 5

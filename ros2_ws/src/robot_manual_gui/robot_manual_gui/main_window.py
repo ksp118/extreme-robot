@@ -1792,6 +1792,8 @@ class ManualMainWindow(QMainWindow):
                 and not (self.node.selected_tool == 'spur_1motor_gripper'
                          and self.fsm_state in ('CALIBRATION_REQUIRED', 'STOPPED', 'READY'))
                 and not (self.node.selected_tool == 'dual_motor_gripper'
+                         and self.node.control_scope == 'END_EFFECTOR_ONLY')
+                and not (self.node.selected_tool == 'cleaner'
                          and self.node.control_scope == 'END_EFFECTOR_ONLY')):
             QMessageBox.warning(
                 self, ko('Ownership denied'),

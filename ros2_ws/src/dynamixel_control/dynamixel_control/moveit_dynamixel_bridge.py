@@ -1981,9 +1981,17 @@ class MoveItDynamixelBridge(Node):
         if detected is None:
             self._tool_detection_reason = provider.last_reason
             return
-        if self.tool_detached or self.emergency_stop_active:
-            self._tool_detection_reason = 'automatic switch blocked by safety latch'
+        # A stable, supported signature is physical evidence that a replacement
+        # tool is now fitted.  It is safe to retire the *tool-detached* latch
+        # here: torque stays off until the new profile/configuration succeeds.
+        # An emergency-stop latch is deliberately different and survives any
+        # tool swap; it still requires the explicit program restart path.
+        if self.emergency_stop_active:
+            self._tool_detection_reason = 'automatic switch blocked by emergency stop latch'
             return
+        if self.tool_detached:
+            self.tool_detached = False
+            self._tool_detection_reason = 'confirmed replacement tool clears detach latch'
         if not self._automatic_switch_safe():
             self._tool_detection_reason = (
                 f'automatic switch waiting for safe arm state; '
@@ -2163,7 +2171,7 @@ class MoveItDynamixelBridge(Node):
         if requested == 'cleaner' and new_ids:
             if len(new_ids) != 1 or len(selection.profile.get('joint_names', [])) != 1:
                 raise ToolProfileError('cleaner requires one actuator and one joint')
-            if new_ids[0] in {config['id'] for config in JOINT_CONFIG.values()}:
+            if new_ids[0] in ARM_IDS:
                 raise ToolProfileError('cleaner actuator conflicts with an arm joint')
 
         # Stop and unregister the old tool before changing the allowlist.  This
@@ -2469,13 +2477,27 @@ class MoveItDynamixelBridge(Node):
     def _configure_cleaning_actuator(self):
         """Dynamixel Protocol 2.0 velocity mode(Operating Mode=1)로 설정한다."""
         dxl_id = self.cleaning_actuator_id
-        self.packet_handler.write1ByteTxRx(
-            self.port_handler, dxl_id, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
-        result, error = self.packet_handler.write1ByteTxRx(
-            self.port_handler, dxl_id, ADDR_OPERATING_MODE, 1)
-        if result != 0 or error != 0:
+        try:
+            with self._bus_lock:
+                self._write_register(
+                    dxl_id, ADDR_TORQUE_ENABLE, 1, TORQUE_DISABLE,
+                    'cleaner torque disable')
+                self._write_register(
+                    dxl_id, ADDR_OPERATING_MODE, 1, 1,
+                    'cleaner velocity mode')
+                # A replacement motor can retain a non-zero Goal Velocity
+                # from a previous owner.  Zero/read it before torque-on so a
+                # profile transition never starts the cleaner by itself.
+                self._write_register(
+                    dxl_id, ADDR_GOAL_VELOCITY, 4, 0,
+                    'cleaner zero goal velocity')
+                if self._read_register(
+                        dxl_id, ADDR_GOAL_VELOCITY, 4,
+                        'cleaner zero goal velocity readback', signed=True) != 0:
+                    raise RuntimeError('cleaner zero goal velocity readback failed')
+        except Exception as exc:
             self.get_logger().error(
-                f"Cleaning actuator velocity-mode setup failed: id={dxl_id}")
+                f"Cleaning actuator velocity-mode setup failed: id={dxl_id}: {exc}")
             self.cleaning_configured = False
             return
         if self._enable_torque(dxl_id, self.cleaning_actuator_joint):
