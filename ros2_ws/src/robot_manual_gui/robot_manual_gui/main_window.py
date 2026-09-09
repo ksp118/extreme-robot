@@ -332,7 +332,13 @@ class ManualMainWindow(QMainWindow):
                 'motor_minus_one', 'motor_plus_one', 'developer_direct_box',
                 'developer_enable', 'developer_disable', 'developer_minus',
                 'developer_plus', 'developer_minus_five',
-                'developer_plus_five', 'developer_hold'):
+                'developer_plus_five', 'developer_hold',
+                'spur_calibration_box', 'spur_calibration_state',
+                'spur_calibration_start', 'spur_calibration_enable',
+                'spur_calibration_disable', 'spur_calibration_minus',
+                'spur_calibration_plus', 'spur_calibration_capture_open',
+                'spur_calibration_capture_close',
+                'spur_calibration_validate', 'spur_calibration_save'):
             setattr(self, name, None)
         box = QGroupBox(ko('End Effector'))
         layout = QVBoxLayout(box)
@@ -380,6 +386,51 @@ class ManualMainWindow(QMainWindow):
             developer.addWidget(self.developer_minus_five, 3, 0, 1, 2)
             developer.addWidget(self.developer_plus_five, 3, 2)
             layout.addWidget(self.developer_direct_box)
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            # Reuse the existing bridge-owned CalibrationSession rather than
+            # creating a second calibration protocol in the GUI.  This gives
+            # the operator one compact, ordered endpoint workflow.
+            self.spur_calibration_box = QGroupBox(ko('그리퍼 끝점 캘리브레이션 · ID 5'))
+            calibration = QGridLayout(self.spur_calibration_box)
+            guide = QLabel(ko(
+                '1. 시작  2. 토크 켜기  3. ±0.5°로 위치 조정  '
+                '4. 열림/닫힘 현재 위치 기록  5. 검증  6. 저장'))
+            guide.setWordWrap(True)
+            calibration.addWidget(guide, 0, 0, 1, 4)
+            self.spur_calibration_state = QLabel(ko('시작 전'))
+            calibration.addWidget(self.spur_calibration_state, 1, 0, 1, 4)
+            self.spur_calibration_start = QPushButton(ko('캘리브레이션 시작'))
+            self.spur_calibration_enable = QPushButton(ko('토크 켜기'))
+            self.spur_calibration_disable = QPushButton(ko('토크 끄기'))
+            self.spur_calibration_start.clicked.connect(self._start_calibration)
+            self.spur_calibration_enable.clicked.connect(self._enable_spur_motor)
+            self.spur_calibration_disable.clicked.connect(self._disable_spur_motor)
+            calibration.addWidget(self.spur_calibration_start, 2, 0, 1, 2)
+            calibration.addWidget(self.spur_calibration_enable, 2, 2)
+            calibration.addWidget(self.spur_calibration_disable, 2, 3)
+            self.spur_calibration_minus = QPushButton(ko('−0.5° 이동'))
+            self.spur_calibration_plus = QPushButton(ko('+0.5° 이동'))
+            self.spur_calibration_minus.clicked.connect(
+                lambda: self._calibration_jog(-0.5))
+            self.spur_calibration_plus.clicked.connect(
+                lambda: self._calibration_jog(0.5))
+            calibration.addWidget(self.spur_calibration_minus, 3, 0, 1, 2)
+            calibration.addWidget(self.spur_calibration_plus, 3, 2, 1, 2)
+            self.spur_calibration_capture_open = QPushButton(ko('현재 위치를 열림으로 기록'))
+            self.spur_calibration_capture_close = QPushButton(ko('현재 위치를 닫힘으로 기록'))
+            self.spur_calibration_capture_open.clicked.connect(
+                lambda: self._capture_spur_endpoint('open'))
+            self.spur_calibration_capture_close.clicked.connect(
+                lambda: self._capture_spur_endpoint('close'))
+            calibration.addWidget(self.spur_calibration_capture_open, 4, 0, 1, 2)
+            calibration.addWidget(self.spur_calibration_capture_close, 4, 2, 1, 2)
+            self.spur_calibration_validate = QPushButton(ko('기록값 검증'))
+            self.spur_calibration_save = QPushButton(ko('프로파일 저장'))
+            self.spur_calibration_validate.clicked.connect(self._validate_spur_calibration)
+            self.spur_calibration_save.clicked.connect(self._save_spur_calibration)
+            calibration.addWidget(self.spur_calibration_validate, 5, 0, 1, 2)
+            calibration.addWidget(self.spur_calibration_save, 5, 2, 1, 2)
+            layout.addWidget(self.spur_calibration_box)
         if not hasattr(self, 'common_enable'):
             self.open_button = QPushButton(ko('OPEN'))
             self.close_button = QPushButton(ko('CLOSE'))
@@ -1282,6 +1333,43 @@ class ManualMainWindow(QMainWindow):
         self.start_cal.setEnabled(
             spur and manual and bool(self.tool_status.get('calibration_jog_enabled'))
             and not calibration.get('active', False))
+        if self.spur_calibration_state is not None:
+            active = bool(calibration.get('active'))
+            enabled = bool(calibration.get('enabled'))
+            captures = calibration.get('captures', {})
+            both_captured = (set(captures) == {'open', 'close'}
+                             and captures['open'] != captures['close'])
+            if not active:
+                state = '시작 전'
+            elif not enabled:
+                state = '토크 켜기 필요'
+            elif calibration.get('validated'):
+                state = '검증 완료 · 저장 가능'
+            elif both_captured:
+                state = '열림/닫힘 기록 완료 · 검증 필요'
+            else:
+                state = '±0.5° 이동 후 열림/닫힘 위치를 각각 기록하세요'
+            self.spur_calibration_state.setText(ko(state))
+            ready = (spur and manual and self._status_fresh()
+                     and not bool(self.tool_status.get('read_only'))
+                     and not bool(self.tool_status.get('emergency_stop'))
+                     and not bool(self.tool_status.get('tool_detached')))
+            healthy = (self._gripper_samples().get(5, {}).get('online')
+                       and self._gripper_samples().get(5, {}).get(
+                           'hardware_error') == 0)
+            self.spur_calibration_start.setEnabled(ready and healthy and not active)
+            self.spur_calibration_enable.setEnabled(
+                ready and active and healthy and not enabled)
+            self.spur_calibration_disable.setEnabled(active and enabled)
+            for button in (self.spur_calibration_minus,
+                           self.spur_calibration_plus,
+                           self.spur_calibration_capture_open,
+                           self.spur_calibration_capture_close):
+                button.setEnabled(ready and active and enabled and healthy)
+            self.spur_calibration_validate.setEnabled(
+                ready and active and both_captured)
+            self.spur_calibration_save.setEnabled(
+                ready and active and bool(calibration.get('validated')))
         self._refresh_common_buttons()
         self._refresh_developer_direct_buttons()
 
@@ -1600,6 +1688,11 @@ class ManualMainWindow(QMainWindow):
             return
         if self._spur_manual_ready() and self.node.command_calibration('manual_step', delta_deg=float(degrees)):
             self._append_log(f'ID5 CalibrationSession jog {degrees:+.1f}° requested')
+
+    def _calibration_jog(self, degrees):
+        """Compact panel adapter for the existing ID5 CalibrationSession."""
+        if self.node.command_calibration('jog_motor_degrees', delta_deg=float(degrees)):
+            self._append_log(f'캘리브레이션 ID5 이동 요청: {degrees:+.1f}°')
 
     def _capture_spur_endpoint(self, label):
         sample = self._gripper_samples().get(5, {})

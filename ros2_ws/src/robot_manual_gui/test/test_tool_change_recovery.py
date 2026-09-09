@@ -347,3 +347,14 @@ def test_cleaner_common_buttons_send_on_press_not_release():
     assert 'self.close_button.pressed.connect' in source
     assert 'self.tool_stop.pressed.connect' in source
     assert 'def _common_pressed' in source
+
+
+def test_spur_calibration_panel_reuses_existing_calibration_session_commands():
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / 'robot_manual_gui/main_window.py').read_text()
+    assert "그리퍼 끝점 캘리브레이션 · ID 5" in source
+    assert "self._capture_spur_endpoint('open')" in source
+    assert "self._capture_spur_endpoint('close')" in source
+    assert "self._calibration_jog(-0.5)" in source
+    assert "command_calibration('jog_motor_degrees'" in source
