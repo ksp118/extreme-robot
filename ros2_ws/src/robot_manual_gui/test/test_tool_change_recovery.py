@@ -357,4 +357,6 @@ def test_spur_calibration_panel_reuses_existing_calibration_session_commands():
     assert "self._capture_spur_endpoint('open')" in source
     assert "self._capture_spur_endpoint('close')" in source
     assert "self._calibration_jog(-0.5)" in source
+    assert "self._calibration_jog(-5.0)" in source
+    assert "self._calibration_jog(5.0)" in source
     assert "command_calibration('jog_motor_degrees'" in source

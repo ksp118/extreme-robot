@@ -21,7 +21,10 @@ class CalibrationSessionError(RuntimeError):
 class CalibrationSession:
     """Operator-driven endpoint capture with one-click, ID5-only jogs."""
 
-    ALLOWED_DEGREES = frozenset((-1.0, -0.5, 0.5, 1.0))
+    # Endpoint discovery often needs a coarse approach before the final
+    # half-degree witness capture.  Keep this a finite one-click set rather
+    # than accepting arbitrary GUI values.
+    ALLOWED_DEGREES = frozenset((-5.0, -1.0, -0.5, 0.5, 1.0, 5.0))
     ID = 5
     # Captures are deliberately made at the operator's chosen command limits.
     # Until a separately measured mechanical margin exists, no hidden numeric
@@ -63,7 +66,8 @@ class CalibrationSession:
     def jog_motor_degrees(self, delta_deg):
         self._require_active()
         if float(delta_deg) not in self.ALLOWED_DEGREES:
-            raise CalibrationSessionError('only one-click ±0.5° or ±1.0° jog is allowed')
+            raise CalibrationSessionError(
+                'only one-click ±0.5°, ±1.0°, or ±5.0° jog is allowed')
         if not self.enabled:
             raise CalibrationSessionError('ID5 must be explicitly enabled before jog')
         self._require_healthy_feedback()
