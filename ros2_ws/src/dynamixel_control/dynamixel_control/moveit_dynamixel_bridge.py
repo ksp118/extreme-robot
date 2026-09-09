@@ -1759,7 +1759,15 @@ class MoveItDynamixelBridge(Node):
             2: self.packet_handler.read2ByteTxRx,
             4: self.packet_handler.read4ByteTxRx,
         }[size]
-        value, result, error = reader(self.port_handler, dxl_id, address)
+        try:
+            value, result, error = reader(self.port_handler, dxl_id, address)
+        except Exception as exc:
+            # Dynamixel SDK can raise SerialException directly when the USB
+            # adapter is unplugged or another process owns the port.  Turn it
+            # into the same recoverable command/feedback failure as a packet
+            # timeout; a ROS callback must never take the bridge down.
+            raise RuntimeError(
+                f'ID {dxl_id} {label} read transport failed: {exc}') from exc
         if result != 0 or error != 0:
             raise RuntimeError(
                 f"ID {dxl_id} {label} read failed: result={result}, error={error}")
@@ -1792,29 +1800,37 @@ class MoveItDynamixelBridge(Node):
         self._fsm_id_allowed(dxl_id)
         if self.mock_mode:
             return self._tool_samples.get(int(dxl_id), {}).get('position')
-        return self._read_register(dxl_id, ADDR_PRESENT_POSITION, 4,
-                                   'FSM present position', signed=True)
+        with self._bus_lock:
+            return self._read_register(dxl_id, ADDR_PRESENT_POSITION, 4,
+                                       'FSM present position', signed=True)
 
     def read_torque(self, dxl_id):
         self._fsm_id_allowed(dxl_id)
         if self.mock_mode:
             return int(self._tool_samples.get(int(dxl_id), {}).get(
                 'torque_state') == 'ON')
-        return self._read_register(dxl_id, ADDR_TORQUE_ENABLE, 1, 'FSM torque')
+        with self._bus_lock:
+            return self._read_register(dxl_id, ADDR_TORQUE_ENABLE, 1, 'FSM torque')
 
     def read_hardware_error(self, dxl_id):
         self._fsm_id_allowed(dxl_id)
         if self.mock_mode:
             return int(self._tool_samples.get(int(dxl_id), {}).get(
                 'hardware_error', 0) or 0)
-        return self._read_register(dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
-                                   'FSM hardware error')
+        with self._bus_lock:
+            return self._read_register(dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                                       'FSM hardware error')
 
     def read_model(self, dxl_id):
         self._fsm_id_allowed(dxl_id)
         if self.mock_mode:
             return self._tool_samples.get(int(dxl_id), {}).get('model')
-        model, result, error = self.packet_handler.ping(self.port_handler, dxl_id)
+        try:
+            with self._bus_lock:
+                model, result, error = self.packet_handler.ping(
+                    self.port_handler, dxl_id)
+        except Exception as exc:
+            raise RuntimeError(f'ID {dxl_id} model read transport failed: {exc}') from exc
         if result != 0 or error != 0:
             raise RuntimeError(f'ID {dxl_id} model read failed')
         return model
@@ -1826,8 +1842,9 @@ class MoveItDynamixelBridge(Node):
         if self.mock_mode:
             self._tool_samples[int(dxl_id)]['position'] = int(tick)
             return
-        self._write_register(dxl_id, ADDR_GOAL_POSITION, 4,
-                             int(tick) & 0xffffffff, 'FSM goal position')
+        with self._bus_lock:
+            self._write_register(dxl_id, ADDR_GOAL_POSITION, 4,
+                                 int(tick) & 0xffffffff, 'FSM goal position')
 
     def command_dual_targets(self, targets):
         """Synchronously dispatch and supervise one FSM endpoint command."""
@@ -3423,6 +3440,26 @@ class MoveItDynamixelBridge(Node):
         self.group_sync_write.clearParam()
 
     # ------------------------------------------------------------------ feedback
+    def _mark_tool_feedback_offline(self):
+        """Fail closed after a transport-level feedback failure.
+
+        Keep the process and ROS graph alive so an operator can reconnect the
+        adapter or remove a competing serial client.  Stale ``online=True``
+        samples would otherwise leave the GUI offering a torque command after
+        a failed transaction.
+        """
+        for dxl_id in self.tool_ids:
+            sample = dict(self._tool_samples.get(dxl_id, {}))
+            sample.update({
+                'id': dxl_id,
+                'online': False,
+                'position': None,
+                'effort': None,
+                'hardware_error': None,
+                'torque_state': 'UNKNOWN',
+            })
+            self._tool_samples[dxl_id] = sample
+
     def publish_joint_states(self):
         if self.mock_mode:
             msg = JointState()
@@ -3448,8 +3485,19 @@ class MoveItDynamixelBridge(Node):
             self.tool_joint_state_pub.publish(JointState())
             self.fault_pub.publish(Bool(data=True))
             return
-        with self._bus_lock:
-            self.group_sync_read.txRxPacket()
+        try:
+            with self._bus_lock:
+                self.group_sync_read.txRxPacket()
+        except Exception as exc:
+            # This timer runs in the executor.  Do not allow a transient USB
+            # read failure to terminate the bridge and make the GUI report a
+            # misleading "control node disconnected" state.
+            self.get_logger().warn(f'joint feedback transport failed: {exc}')
+            self._mark_tool_feedback_offline()
+            self.joint_state_pub.publish(JointState())
+            self.tool_joint_state_pub.publish(JointState())
+            self.fault_pub.publish(Bool(data=True))
+            return
         # 일부 ID가 버스에 없어도 응답받은 ID만 처리 (result 무시)
 
         msg = JointState()

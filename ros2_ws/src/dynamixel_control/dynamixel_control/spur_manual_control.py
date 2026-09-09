@@ -26,6 +26,11 @@ class SpurManualControl:
             b.tool_fsm.startup()
             if b.tool_fsm.state.name != 'READY':
                 raise RuntimeError('ID5 FSM startup not READY')
+            # A GUI click may be delivered again before its next status
+            # update.  Torque Enable is already the requested state, so do
+            # not add another serial write/read cycle to a busy bus.
+            if b.read_torque(5) == 1:
+                return
             b.set_torque(5, True)
             return
         if command == 'manual_hold':

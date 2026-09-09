@@ -69,3 +69,13 @@ def test_arm_fsm_subscribes_to_both_feedback_streams():
               ).read_text(encoding='utf-8')
     assert "JointState, '/joint_states', self._on_joint_states" in source
     assert "JointState, '/tool/joint_states', self._on_joint_states" in source
+
+
+def test_feedback_transport_exception_is_contained_and_fails_closed():
+    source = (Path(__file__).parents[1] / 'dynamixel_control' /
+              'moveit_dynamixel_bridge.py').read_text(encoding='utf-8')
+    feedback = source[source.index('    def publish_joint_states'):]
+    assert 'except Exception as exc:' in feedback
+    assert 'joint feedback transport failed' in feedback
+    assert 'self._mark_tool_feedback_offline()' in feedback
+    assert 'self.fault_pub.publish(Bool(data=True))' in feedback
