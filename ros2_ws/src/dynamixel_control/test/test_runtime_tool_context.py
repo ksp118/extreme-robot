@@ -81,3 +81,13 @@ def test_cleaner_feedback_falls_back_to_one_id_direct_reads_only():
     assert 'ADDR_HARDWARE_ERROR_STATUS' in method
     assert 'ADDR_PRESENT_POSITION' in method
     assert 'ADDR_PRESENT_LOAD' in method
+
+
+def test_cleaner_velocity_write_uses_the_shared_bus_lock():
+    source = Path(__file__).parents[1] / 'dynamixel_control/moveit_dynamixel_bridge.py'
+    text = source.read_text()
+    start = text.index('    def _on_cleaning_enable')
+    end = text.index('    def rad_to_tick', start)
+    command = text[start:end]
+    assert 'with self._bus_lock:' in command
+    assert "'cleaner goal velocity'" in command

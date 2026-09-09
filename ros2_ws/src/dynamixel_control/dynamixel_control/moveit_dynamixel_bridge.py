@@ -2646,13 +2646,20 @@ class MoveItDynamixelBridge(Node):
         if not self.cleaning_configured or (msg.data and not self._tool_backend_ready()):
             self.get_logger().error('Cleaning actuator/profile is not ready')
             return
-        velocity = rotation * self.cleaning_direction * self.cleaning_velocity_raw if msg.data else 0
-        result, error = self.packet_handler.write4ByteTxRx(
-            self.port_handler, self.cleaning_actuator_id, ADDR_GOAL_VELOCITY,
-            velocity & 0xffffffff)
-        if result != 0 or error != 0:
+        velocity = (rotation * self.cleaning_direction * self.cleaning_velocity_raw
+                    if msg.data else 0)
+        try:
+            # publish_joint_states(), signature detection and GUI commands all
+            # share this Protocol 2.0 port.  Without the same lock used by the
+            # readers, a velocity command intermittently returns COMM_PORT_BUSY
+            # (-1000) even though the cleaner is online and torque-enabled.
+            with self._bus_lock:
+                self._write_register(
+                    self.cleaning_actuator_id, ADDR_GOAL_VELOCITY, 4,
+                    velocity & 0xffffffff, 'cleaner goal velocity')
+        except Exception as exc:
             self.get_logger().error(
-                f"Cleaning velocity write failed: result={result}, error={error}")
+                f'Cleaning velocity write failed: {exc}')
             return
         self.cleaning_running = bool(msg.data)
         if isinstance(self.tool_fsm, CleanerFSM):
