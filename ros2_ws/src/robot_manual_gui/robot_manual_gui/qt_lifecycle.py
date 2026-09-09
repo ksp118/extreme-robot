@@ -11,6 +11,47 @@ Nothing here touches hardware, motion, or the tool contract.
 """
 
 import signal
+import os
+
+
+def restart_parent_launch(parent_pid=None, read_cmdline=None,
+                          start_detached=None, terminate=None):
+    """Replace the parent ``ros2 launch`` after an E-stop.
+
+    The GUI is a child of launch, so restarting only this process would retain
+    the bridge's E-stop latch.  A delayed detached copy of the exact parent
+    command lets launch terminate every old child and release the serial bus
+    before the replacement stack opens it.  This function never publishes an
+    E-stop reset or a motor command.
+    """
+    parent_pid = os.getppid() if parent_pid is None else int(parent_pid)
+    if read_cmdline is None:
+        def read_cmdline(pid):
+            with open(f'/proc/{pid}/cmdline', 'rb') as stream:
+                return stream.read()
+    raw = read_cmdline(parent_pid)
+    if isinstance(raw, str):
+        raw = raw.encode()
+    command = [part.decode(errors='surrogateescape')
+               for part in raw.split(b'\0') if part]
+    if (not any(part == 'ros2' or part.endswith('/ros2') for part in command)
+            or 'launch' not in command
+            or 'robot_manual_gui' not in command
+            or 'manual_gui.launch.py' not in command):
+        raise RuntimeError('현재 GUI를 시작한 ros2 launch 명령을 찾지 못했습니다')
+    if start_detached is None:
+        from PyQt5.QtCore import QProcess
+        start_detached = QProcess.startDetached
+    # ``$@`` retains every original argument exactly; do not rebuild the launch
+    # command from UI state, which could silently drop a safety argument.
+    started = start_detached(
+        '/bin/bash', ['-lc', 'sleep 2; exec "$@"', 'gui-restart', *command])
+    if isinstance(started, tuple):
+        started = started[0]
+    if not started:
+        raise RuntimeError('새 프로그램 시작에 실패했습니다')
+    (os.kill if terminate is None else terminate)(parent_pid, signal.SIGTERM)
+    return command
 
 
 # Fast enough that Ctrl-C feels immediate, slow enough to stay free.

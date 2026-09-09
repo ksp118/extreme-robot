@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
 
 from robot_manual_gui.ros_interface import ARM_JOINTS
 from robot_manual_gui.korean_text import ko
+from robot_manual_gui.qt_lifecycle import restart_parent_launch
 from dynamixel_control.tool_manager import ToolManager
 
 
@@ -137,13 +138,14 @@ class ManualMainWindow(QMainWindow):
         self.estop.clicked.connect(self._estop)
         self.detach = QPushButton(ko('TOOL DETACHED'))
         self.detach.clicked.connect(self._detach)
-        self.reset = QPushButton(ko('RESET E-STOP (restart required)'))
-        self.reset.setEnabled(False)
+        self.restart_program = QPushButton(ko('프로그램 재구동'))
+        self.restart_program.setEnabled(False)
+        self.restart_program.clicked.connect(self._restart_program)
         self.estop_state = QLabel(ko('E-STOP: FALSE'))
         self.estop_state.setStyleSheet(TRUE_STYLE)
         safety.addWidget(self.estop, 3)
         safety.addWidget(self.detach)
-        safety.addWidget(self.reset)
+        safety.addWidget(self.restart_program)
         safety.addWidget(self.estop_state)
         outer.addLayout(safety)
 
@@ -980,6 +982,7 @@ class ManualMainWindow(QMainWindow):
         estop = bool(status.get('emergency_stop'))
         self.estop_state.setText(ko(f'E-STOP: {str(estop).upper()}'))
         self.estop_state.setStyleSheet(FALSE_STYLE if estop else TRUE_STYLE)
+        self.restart_program.setEnabled(estop)
         self._rebuild_diagnostics(status.get('actuators', []))
         self._update_gripper_feedback()
         self._refresh_buttons()
@@ -1827,6 +1830,26 @@ class ManualMainWindow(QMainWindow):
         self.node.emergency_stop()
         self.estop_state.setText(ko('E-STOP: REQUESTED'))
         self.estop_state.setStyleSheet(FALSE_STYLE)
+        self.restart_program.setEnabled(False)
+
+    def _restart_program(self):
+        """Restart the whole launch after the bridge has latched an E-stop."""
+        if not self.tool_status.get('emergency_stop'):
+            return
+        answer = QMessageBox.question(
+            self, ko('프로그램 재구동'),
+            ko('비상 정지 상태입니다. 현재 프로그램을 종료하고 다시 시작할까요?'))
+        if answer != QMessageBox.Yes:
+            return
+        self.restart_program.setEnabled(False)
+        try:
+            restart_parent_launch()
+        except Exception as exc:
+            self.restart_program.setEnabled(True)
+            self._append_log(f'프로그램 재구동 실패: {exc}')
+            return
+        self._append_log('비상 정지 프로그램을 재구동합니다')
+        QApplication.instance().quit()
 
     def _detach(self):
         answer = QMessageBox.question(

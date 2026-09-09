@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 ROOT = Path(__file__).parents[1] / 'robot_manual_gui'
@@ -101,6 +103,31 @@ def test_shutdown_skips_context_teardown_when_already_down():
                     shutdown_ros=lambda: called.append('rclpy'),
                     ok=lambda: False) == []
     assert called == []
+
+
+def test_restart_parent_launch_replays_exact_command_after_a_delay():
+    from robot_manual_gui.qt_lifecycle import restart_parent_launch
+
+    started, terminated = [], []
+    command = restart_parent_launch(
+        parent_pid=123,
+        read_cmdline=lambda _pid: (
+            b'/usr/bin/python3\0/opt/ros/humble/bin/ros2\0launch\0'
+            b'robot_manual_gui\0manual_gui.launch.py\0read_only:=false\0'),
+        start_detached=lambda program, args: started.append((program, args)) or True,
+        terminate=lambda pid, signum: terminated.append((pid, signum)))
+    assert command[-1] == 'read_only:=false'
+    assert started == [('/bin/bash', [
+        '-lc', 'sleep 2; exec "$@"', 'gui-restart', *command])]
+    assert terminated == [(123, signal.SIGTERM)]
+
+
+def test_restart_parent_launch_rejects_an_unknown_parent():
+    from robot_manual_gui.qt_lifecycle import restart_parent_launch
+
+    with pytest.raises(RuntimeError, match='ros2 launch'):
+        restart_parent_launch(
+            parent_pid=123, read_cmdline=lambda _pid: b'/bin/bash\0')
 
 
 def test_process_exits_on_sigterm_without_leaving_a_ghost():
