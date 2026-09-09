@@ -637,6 +637,8 @@ class ArmFsmNode(Node):
             ChassisMode, '/chassis_mode', self._on_chassis_mode, HEARTBEAT_QOS)
         self.create_subscription(JointState, '/joint_states', self._on_joint_states, 10)
         self.create_subscription(
+            JointState, '/tool/joint_states', self._on_joint_states, 10)
+        self.create_subscription(
             TaskCommand, g('vla_command_topic').value, self._on_task_command, 10)
         # 계약 §5.1 "locked heartbeat는 ... controller fault 0 ... 을 실제 확인한다" —
         # moveit_dynamixel_bridge가 Hardware Error Status를 집계해 발행(내부용 토픽,

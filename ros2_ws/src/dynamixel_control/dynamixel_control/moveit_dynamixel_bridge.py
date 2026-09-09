@@ -794,6 +794,15 @@ class MoveItDynamixelBridge(Node):
             "/joint_states",
             10,
         )
+        # MoveIt/robot_state_publisher의 로봇 모델은 launch 시점에 고정된다.
+        # 런타임에 교체된 도구 조인트를 /joint_states에 섞으면 모델에
+        # 없는 이름으로 move_group이 종료할 수 있다. 도구 피드백은 별도 토픽과
+        # /tool/status로 보존하고, /joint_states는 검증된 팔 모델만 유지한다.
+        self.tool_joint_state_pub = self.create_publisher(
+            JointState,
+            "/tool/joint_states",
+            10,
+        )
         self.tool_type_pub = self.create_publisher(String, '/tool/type', 10)
         self.tool_status_pub = self.create_publisher(String, '/tool/status', 10)
         self.control_mode_status_pub = self.create_publisher(
@@ -2942,20 +2951,25 @@ class MoveItDynamixelBridge(Node):
         if self.mock_mode:
             msg = JointState()
             msg.header.stamp = self.get_clock().now().to_msg()
+            tool_msg = JointState()
+            tool_msg.header.stamp = msg.header.stamp
             if self.control_scope == 'FULL_ROBOT':
                 msg.name = list(self._mock_arm_positions)
                 msg.position = list(self._mock_arm_positions.values())
                 msg.effort = [0.0] * len(msg.name)
             for joint in self.tool_profile.get('joint_names', []):
                 sample = next(iter(self._tool_samples.values()), {})
-                msg.name.append(joint)
-                msg.position.append(float(sample.get('position', 0)) * 2 * math.pi / 4096)
-                msg.effort.append(float(sample.get('effort', 0)))
+                tool_msg.name.append(joint)
+                tool_msg.position.append(
+                    float(sample.get('position', 0)) * 2 * math.pi / 4096)
+                tool_msg.effort.append(float(sample.get('effort', 0)))
             self.joint_state_pub.publish(msg)
+            self.tool_joint_state_pub.publish(tool_msg)
             self.fault_pub.publish(Bool(data=False))
             return
         if not self.port_connected:
             self.joint_state_pub.publish(JointState())
+            self.tool_joint_state_pub.publish(JointState())
             self.fault_pub.publish(Bool(data=True))
             return
         with self._bus_lock:
@@ -2964,6 +2978,8 @@ class MoveItDynamixelBridge(Node):
 
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
+        tool_msg = JointState()
+        tool_msg.header.stamp = msg.header.stamp
 
         # controller fault 집계 — SyncRead 에 등록된(토크 ON 성공) ID 중 하나라도
         # Hardware Error Status != 0 이거나 이번 tick 응답이 없으면 fault=True.
@@ -3007,9 +3023,10 @@ class MoveItDynamixelBridge(Node):
                     'joint': self.cleaning_actuator_joint,
                     'position': int(tick), 'effort': float(abs(load_raw)),
                     'online': hw_error == 0}
-                msg.name.append(self.cleaning_actuator_joint)
-                msg.position.append(float(to_signed(tick, LEN_PRESENT_POSITION)))
-                msg.effort.append(float(load_raw))
+                tool_msg.name.append(self.cleaning_actuator_joint)
+                tool_msg.position.append(
+                    float(to_signed(tick, LEN_PRESENT_POSITION)))
+                tool_msg.effort.append(float(load_raw))
 
         # The spur tool has exactly one feedback topology.  Do not fall through
         # to the legacy rack/pinion aggregation below: that path assumes the
@@ -3050,6 +3067,12 @@ class MoveItDynamixelBridge(Node):
                         # remains valid across periodic position reads.
                         'model': self._tool_samples.get(dxl_id, {}).get('model'),
                         **control}
+                    if joint_names:
+                        tool_msg.name.append(joint_names[0])
+                        tool_msg.position.append(
+                            float(self._tool_samples[dxl_id]['position'])
+                            * 2 * math.pi / 4096)
+                        tool_msg.effort.append(float(load_raw))
 
         # Legacy dual-gripper feedback is deliberately isolated from ID5.  It
         # retains the existing ID3/ID4 tuple aggregation for the dual profile.
@@ -3133,12 +3156,13 @@ class MoveItDynamixelBridge(Node):
                 # calling the removed legacy conversion helper.
                 finger_vel = 0.0
                 for jn in self.gripper_joints:
-                    msg.name.append(jn)
-                    msg.position.append(finger_rad)
-                    msg.velocity.append(finger_vel)
-                    msg.effort.append(float(max_abs_load))
+                    tool_msg.name.append(jn)
+                    tool_msg.position.append(finger_rad)
+                    tool_msg.velocity.append(finger_vel)
+                    tool_msg.effort.append(float(max_abs_load))
 
         self.joint_state_pub.publish(msg)
+        self.tool_joint_state_pub.publish(tool_msg)
         self.fault_pub.publish(Bool(data=fault))
 
     def _read_sample(self, dxl_id):
