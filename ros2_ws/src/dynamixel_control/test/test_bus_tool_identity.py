@@ -56,6 +56,22 @@ def test_profile_discovery_uses_the_shared_bus_lock():
     assert 'with self._bus_lock:' in source[start:end]
 
 
+def test_stable_active_tool_uses_only_its_own_fast_probe():
+    """A live cleaner must not probe absent gripper IDs every poll period."""
+    bridge = object.__new__(MoveItDynamixelBridge)
+    provider = BusToolIdentityProvider(PROFILES, lambda _actuator_id: False)
+    bridge._bus_tool_identity = provider
+    bridge.tool_type = 'cleaner'
+    bridge.tool_ids = [2]
+    bridge._tool_detection_reason = 'old state'
+    probed = []
+    bridge._probe_tool_id = lambda actuator_id: (probed.append(actuator_id) or True)
+    assert bridge._observe_active_tool_signature() == 'cleaner'
+    assert probed == [2]
+    assert provider.last_present_ids == {2}
+    assert provider.last_reason == ''
+
+
 def _bridge(observations):
     bridge = object.__new__(MoveItDynamixelBridge)
     bridge._bus_tool_identity = SimpleNamespace(

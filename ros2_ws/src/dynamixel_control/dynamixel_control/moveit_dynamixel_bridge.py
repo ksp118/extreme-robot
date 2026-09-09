@@ -1951,6 +1951,30 @@ class MoveItDynamixelBridge(Node):
         self._tool_detection_reason = provider.last_reason
         return detected
 
+    def _observe_active_tool_signature(self):
+        """Cheap steady-state check before a full replacement scan.
+
+        Full signature discovery pings every supported profile ID.  On a
+        sparse bus, each absent ID can consume a serial timeout while holding
+        ``_bus_lock``.  Running that scan every 0.5 seconds made a cleaner
+        START/STOP command wait behind the detector.  A fitted active tool
+        only needs its own complete signature checked; scan every candidate
+        only after that signature disappears.
+        """
+        provider = self._bus_tool_identity
+        active_ids = frozenset(
+            int(dxl_id) for dxl_id in getattr(self, 'tool_ids', ()))
+        if (provider is None or not active_ids
+                or getattr(provider, '_signatures', {}).get(self.tool_type)
+                != active_ids):
+            return None
+        if not all(self._probe_tool_id(dxl_id) for dxl_id in active_ids):
+            return None
+        provider.last_present_ids = active_ids
+        provider.last_reason = ''
+        self._tool_detection_reason = ''
+        return self.tool_type
+
     def _revalidate_current_tool(self):
         """Handle an explicit request for the already selected tool safely.
 
@@ -2007,7 +2031,12 @@ class MoveItDynamixelBridge(Node):
             self._tool_detection_reason = (
                 f'{self.tool_type} has no physical actuator signature')
             return
-        detected = self._rescan_physical_tool()
+        # While the fitted tool is present this is one (or two for the dual
+        # gripper) fast pings.  A missing signature falls back to the complete
+        # scan so unplug/replacement detection remains unchanged.
+        detected = self._observe_active_tool_signature()
+        if detected is None:
+            detected = self._rescan_physical_tool()
         if not self._confirmed_tool_observation(detected):
             return
 
