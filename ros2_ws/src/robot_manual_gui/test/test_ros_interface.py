@@ -52,6 +52,19 @@ def test_end_effector_scope_blocks_arm_publish_path():
     assert 'CONTROL / TEST SCOPE:' in window_source
 
 
+def test_dashboard_is_scrollable_and_entrypoint_starts_maximized():
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QScrollArea
+
+    _app, window, _goals = _window('END_EFFECTOR_ONLY')
+    assert isinstance(window.centralWidget(), QScrollArea)
+    assert window.scroll_area.widgetResizable()
+    assert window.scroll_area.horizontalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+    assert window.scroll_area.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+    main_source = (ROOT / 'main.py').read_text(encoding='utf-8')
+    assert 'window.showMaximized()' in main_source
+
+
 def test_spur_gui_uses_only_id5_and_requires_explicit_enable():
     ros_source = (ROOT / 'ros_interface.py').read_text(encoding='utf-8')
     window_source = (ROOT / 'main_window.py').read_text(encoding='utf-8')

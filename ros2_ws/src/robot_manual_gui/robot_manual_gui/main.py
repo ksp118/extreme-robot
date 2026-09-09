@@ -29,7 +29,9 @@ def main(args=None):
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
     window = ManualMainWindow(node, signals, profile, node.mock_mode)
-    window.show()
+    # Use the available desktop while retaining window-manager controls.  The
+    # dashboard itself is scrollable on displays smaller than its size hint.
+    window.showMaximized()
     # Installed after rclpy.init so they replace rclpy's own handlers, which
     # take the context down without ever ending this Qt loop.
     signal_timer = install_signal_quit(app)

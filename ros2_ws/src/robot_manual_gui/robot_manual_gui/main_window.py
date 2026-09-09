@@ -8,7 +8,8 @@ from PyQt5.QtWidgets import (
     QAbstractSpinBox, QApplication, QComboBox, QDoubleSpinBox, QFormLayout,
     QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
-    QLineEdit, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+    QLineEdit, QScrollArea, QTableWidget, QTableWidgetItem, QTextEdit,
+    QVBoxLayout, QWidget)
 
 from robot_manual_gui.ros_interface import ARM_JOINTS
 from robot_manual_gui.korean_text import ko
@@ -167,7 +168,15 @@ class ManualMainWindow(QMainWindow):
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(120)
         outer.addWidget(self.log)
-        self.setCentralWidget(root)
+        # Hardware panels can be taller/wider than a laptop display.  Keep the
+        # whole dashboard reachable instead of clipping its lower controls.
+        self.content_widget = root
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area.setWidget(root)
+        self.setCentralWidget(self.scroll_area)
 
     def _status_group(self):
         box = QGroupBox(ko('Connection / Status'))
