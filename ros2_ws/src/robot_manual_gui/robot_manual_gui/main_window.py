@@ -19,6 +19,21 @@ TRUE_STYLE = 'color: #0b7a25; font-weight: bold;'
 FALSE_STYLE = 'color: #b00020; font-weight: bold;'
 ESTOP_STYLE = 'background: #b00020; color: white; font-size: 20px; font-weight: bold;'
 
+# `/tool/status` older than this is not evidence of anything current.
+STATUS_FRESH_S = 1.5
+# The bridge answers a `/tool/change` inside one status period; this is the
+# GUI's own deadline for giving up on an answer.  It only releases the request
+# latch — every motion gate is recomputed from live status afterwards.
+TOOL_CHANGE_TIMEOUT_S = 3.0
+# A request published while `/tool/status` is already stale has no listener we
+# can observe.  Report the lost link instead of making the operator wait out
+# the full deadline, but allow one grace window for a late status sample.
+TOOL_CHANGE_DISCONNECT_GRACE_S = 1.0
+# Every request ends in exactly one of these; `PENDING` is the only state that
+# latches the tool panel.
+TOOL_CHANGE_STATES = (
+    'IDLE', 'PENDING', 'DONE', 'REJECTED', 'TIMEOUT', 'DISCONNECTED', 'CANCELED')
+
 
 class ManualMainWindow(QMainWindow):
     """Hardware-test dashboard backed exclusively by ROS interfaces."""
@@ -33,7 +48,16 @@ class ManualMainWindow(QMainWindow):
         self.profile = profile
         self.mock_mode = mock_mode
         self.tool_status = {}
+        # Injectable so a test can drive the request deadline without sleeping.
+        self._clock = time.monotonic
         self.pending_tool_change = None
+        self.pending_tool_change_started = None
+        self.pending_tool_change_link_ok = False
+        self.tool_change_requested = None
+        self.tool_change_state = 'IDLE'
+        self.tool_change_detail = ''
+        self.tool_change_timeout_s = TOOL_CHANGE_TIMEOUT_S
+        self.tool_change_disconnect_grace_s = TOOL_CHANGE_DISCONNECT_GRACE_S
         self.spur_hold_command = None
         self.spur_hold_timer = QTimer(self)
         self.spur_hold_timer.setInterval(100)
@@ -153,6 +177,8 @@ class ManualMainWindow(QMainWindow):
         for key, title in (
                 ('connection', 'Bridge connection'),
                 ('u2d2', 'U2D2 / serial'), ('tool_type', 'Tool type'),
+                ('tool_change', 'Tool change request'),
+                ('tool_block', 'Blocked reason'),
                 ('profile_valid', 'Profile valid'),
                 ('calibration_valid', 'Calibration / endpoints valid'),
                 ('actuators_discovered', 'Actuators discovered'),
@@ -174,6 +200,7 @@ class ManualMainWindow(QMainWindow):
             title_label = QLabel(ko(title))
             self.status_titles[key] = title_label
             form.addRow(title_label, label)
+        self._refresh_tool_change_labels()
         self._update_status_panel({})
         return box
 
@@ -185,7 +212,10 @@ class ManualMainWindow(QMainWindow):
                        else tool == 'spur_1motor_gripper' if key.startswith('spur_')
                        else True)
             if tool == 'spur_1motor_gripper':
-                visible = key.startswith('spur_') or key == 'fsm'
+                # The request/blocked rows explain a locked panel, so they stay
+                # readable in every tool context.
+                visible = (key.startswith('spur_')
+                           or key in ('fsm', 'tool_change', 'tool_block'))
             label.setVisible(visible)
             self.status_titles[key].setVisible(visible)
         if hasattr(self, 'diag'):
@@ -256,6 +286,12 @@ class ManualMainWindow(QMainWindow):
         self.tool_combo.setCurrentIndex(self.tool_combo.findData(self.node.selected_tool))
         request = QPushButton(ko('REQUEST TOOL CHANGE'))
         request.clicked.connect(self._request_tool_change)
+        # Deliberately outside `tool_control_box`: this is the operator's way
+        # out of a pending request, so it must stay clickable while the tool
+        # panel is latched.
+        self.cancel_tool_change = QPushButton(ko('CANCEL TOOL CHANGE'))
+        self.cancel_tool_change.clicked.connect(self._cancel_tool_change)
+        self.cancel_tool_change.setEnabled(False)
         self.mode_combo = QComboBox()
         for mode in ('FSM', 'MANUAL'):
             self.mode_combo.addItem(ko(mode), mode)
@@ -263,6 +299,7 @@ class ManualMainWindow(QMainWindow):
         mode_request.clicked.connect(self._request_mode)
         form.addRow(ko('Selected tool'), self.tool_combo)
         form.addRow(ko(''), request)
+        form.addRow(ko(''), self.cancel_tool_change)
         form.addRow(ko('Ownership'), self.mode_combo)
         form.addRow(ko(''), mode_request)
         return box
@@ -529,7 +566,7 @@ class ManualMainWindow(QMainWindow):
                     and self.pending_tool_change is None
                     and self.control_mode == 'MANUAL'
                     and self.node.control_scope in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')
-                    and time.monotonic() - self.last_status_time < 1.5
+                    and self._status_fresh()
                     and not status.get('read_only') and not getattr(self.node, 'read_only', False)
                     and not status.get('emergency_stop') and not status.get('tool_detached')
                     and sample.get('online') and sample.get('hardware_error') == 0
@@ -599,7 +636,7 @@ class ManualMainWindow(QMainWindow):
             'no_pending_change': self.pending_tool_change is None,
             'manual': self.control_mode == 'MANUAL',
             'scope': self.node.control_scope == 'END_EFFECTOR_ONLY',
-            'fresh': time.monotonic() - self.last_status_time < 1.5,
+            'fresh': self._status_fresh(),
             'bridge_writable': not bool(status.get('read_only')),
             'gui_writable': not getattr(self.node, 'read_only', False),
             'no_estop': not bool(status.get('emergency_stop')),
@@ -664,16 +701,143 @@ class ManualMainWindow(QMainWindow):
         label.setText(ko('TRUE' if value else 'FALSE'))
         label.setStyleSheet(TRUE_STYLE if value else FALSE_STYLE)
 
+    def _status_fresh(self):
+        """True only while `/tool/status` is recent enough to act on."""
+        return self._clock() - self.last_status_time < STATUS_FRESH_S
+
     def _refresh_connection(self):
-        connected = time.monotonic() - self.last_status_time < 1.5
+        connected = self._status_fresh()
         self._set_bool(self.status_labels['connection'], connected)
         if not connected:
             self._set_bool(self.status_labels['motion_allowed'], False)
+        self._expire_tool_change(connected)
+        self._refresh_buttons()
+
+    def _expire_tool_change(self, connected):
+        """Release a request the bridge never answered.
+
+        This clears the GUI-side latch only.  Nothing here grants motion: the
+        buttons are recomputed from live connection/ready/`motion_allowed`
+        state right after, exactly as they are while no request is pending.
+        """
+        if self.pending_tool_change is None:
+            return
+        started = self.pending_tool_change_started
+        if started is None:
+            return
+        elapsed = self._clock() - started
+        # A live bridge stops publishing status while it performs the switch
+        # (both run on its single executor), so silence right after a healthy
+        # request is not proof of a lost link — only the full deadline is.
+        # Silence on a link that was already dead when the operator clicked is
+        # reported at once instead of making them wait it out.
+        if (not connected and not self.pending_tool_change_link_ok
+                and elapsed >= self.tool_change_disconnect_grace_s):
+            self._finish_tool_change(
+                'DISCONNECTED',
+                f'{elapsed:.1f}초 동안 제어 노드 상태를 받지 못했습니다')
+        elif elapsed >= self.tool_change_timeout_s:
+            self._finish_tool_change(
+                'TIMEOUT', f'{self.tool_change_timeout_s:.1f}초 안에 응답이 없습니다')
+
+    def _finish_tool_change(self, state, detail=''):
+        """Single exit for every request outcome (success, error, give-up)."""
+        if state not in TOOL_CHANGE_STATES:
+            raise ValueError(f'unknown tool change state: {state}')
+        requested = self.pending_tool_change
+        self.pending_tool_change = None
+        self.pending_tool_change_started = None
+        self.tool_change_state = state
+        self.tool_change_detail = detail
+        if requested is not None and state != 'DONE':
+            # Never leave the combo advertising a tool the bridge is not on.
+            active = self.tool_status.get('tool_type', self.node.selected_tool)
+            index = self.tool_combo.findData(active)
+            if index >= 0:
+                self.tool_combo.setCurrentIndex(index)
+        if requested is not None:
+            self._append_log(ko(self._tool_change_message()))
+        # Buttons are deliberately left to the caller: on the success path the
+        # tool panel is rebuilt right after this, and refreshing the old panel
+        # for the new tool touches widgets that do not exist yet.
+
+    def _tool_change_message(self):
+        tool = ko(str(self.tool_change_requested))
+        detail = self.tool_change_detail
+        if self.tool_change_state == 'PENDING':
+            return f'도구 변경 요청: {tool} (응답 대기 중)'
+        if self.tool_change_state == 'DONE':
+            return f'도구 변경 완료: {tool}'
+        if self.tool_change_state == 'REJECTED':
+            return f'도구 변경 거부: {tool} — {detail}'
+        if self.tool_change_state == 'TIMEOUT':
+            return f'도구 변경 응답 없음: {tool} — {detail}. 요청을 해제합니다'
+        if self.tool_change_state == 'DISCONNECTED':
+            return (f'도구 변경 중단: {tool} — {detail}. 제어 노드 연결을 확인하세요')
+        if self.tool_change_state == 'CANCELED':
+            return (f'도구 변경 요청 취소: {tool} — 화면 대기만 취소했고 '
+                    '제어 노드에 이미 전달된 요청은 되돌리지 않습니다')
+        return '도구 변경 요청 없음'
+
+    def _refresh_tool_change_labels(self):
+        """Keep requested/active/blocked visible; display only, no commands."""
+        text = self._tool_change_message()
+        if self.pending_tool_change is not None:
+            elapsed = self._clock() - (self.pending_tool_change_started or self._clock())
+            text = f'{text} {elapsed:.1f}초'
+        label = self.status_labels.get('tool_change')
+        if label is not None:
+            label.setText(ko(text))
+            label.setStyleSheet(
+                FALSE_STYLE if self.tool_change_state in (
+                    'REJECTED', 'TIMEOUT', 'DISCONNECTED') else '')
+        blocked = self.status_labels.get('tool_block')
+        if blocked is not None:
+            reason = self._tool_block_reason()
+            blocked.setText(ko(reason or '없음'))
+            blocked.setStyleSheet(FALSE_STYLE if reason else TRUE_STYLE)
+        cancel = getattr(self, 'cancel_tool_change', None)
+        if cancel is not None:
+            cancel.setEnabled(self.pending_tool_change is not None)
+
+    def _tool_block_reason(self):
+        """Why tool motion is unavailable right now, in the operator's terms.
+
+        Written from GUI-visible state only so an untranslated bridge string is
+        never rendered into this Korean panel.
+        """
+        if not self._status_fresh():
+            return '제어 노드 상태 수신 끊김'
+        if self.pending_tool_change is not None:
+            return '도구 변경 요청 응답 대기 중'
+        status = self.tool_status
+        if status.get('emergency_stop'):
+            return '비상 정지 래치'
+        if status.get('tool_detached'):
+            return '도구 분리 래치'
+        if status.get('read_only') or getattr(self.node, 'read_only', False):
+            return '읽기 전용 모드'
+        if not status.get('profile_valid'):
+            return '도구 설정이 유효하지 않음'
+        if not status.get('actuators_discovered'):
+            return '도구 모터 미감지'
+        if not status.get('calibrated'):
+            return '보정 필요'
+        if self.control_mode != 'MANUAL':
+            return '수동 제어 권한 없음'
+        if not status.get('motion_allowed'):
+            return '토크 미인가 또는 도구 준비 안 됨'
+        return ''
+
+    def _cancel_tool_change(self):
+        if self.pending_tool_change is None:
+            return
+        self._finish_tool_change('CANCELED')
         self._refresh_buttons()
 
     def _update_tool_status(self, status):
         self.tool_status = status
-        self.last_status_time = time.monotonic()
+        self.last_status_time = self._clock()
         previous_tool = self.node.selected_tool
         reported_tool = status.get('tool_type')
         runtime_profile = status.get('tool_profile')
@@ -683,12 +847,9 @@ class ManualMainWindow(QMainWindow):
         if self.pending_tool_change:
             if reported_tool == self.pending_tool_change:
                 self.node.selected_tool = reported_tool
-                self.pending_tool_change = None
-                self._append_log(ko(f'도구 런타임 전환 완료: {reported_tool}'))
+                self._finish_tool_change('DONE')
             elif change.get('error'):
-                self.pending_tool_change = None
-                self.tool_combo.setCurrentIndex(self.tool_combo.findData(reported_tool))
-                self._append_log(ko(f'도구 런타임 전환 거부: {change["error"]}'))
+                self._finish_tool_change('REJECTED', str(change['error']))
         elif (reported_tool in ('spur_1motor_gripper', 'dual_motor_gripper', 'cleaner')
               and reported_tool != self.node.selected_tool):
             # The bridge's active tool is separate from the user's pending
@@ -787,6 +948,7 @@ class ManualMainWindow(QMainWindow):
         self._refresh_buttons()
 
     def _refresh_buttons(self):
+        self._refresh_tool_change_labels()
         self.tool_control_box.setEnabled(self.pending_tool_change is None)
         manual = self.control_mode == 'MANUAL'
         end_effector_only = self.node.control_scope == 'END_EFFECTOR_ONLY'
@@ -997,7 +1159,7 @@ class ManualMainWindow(QMainWindow):
                     and self.pending_tool_change is None
                     and self.control_mode == 'MANUAL'
                     and self.node.control_scope == 'END_EFFECTOR_ONLY'
-                    and time.monotonic() - self.last_status_time < 1.5
+                    and self._status_fresh()
                     and status.get('tool_type') == self.node.selected_tool
                     and status.get('profile_valid') and status.get('calibrated')
                     and not status.get('read_only') and not getattr(self.node, 'read_only', False)
@@ -1029,7 +1191,7 @@ class ManualMainWindow(QMainWindow):
             self.node.command_calibration('manual_hold')
 
     def _tool_motion_ready(self):
-        fresh = time.monotonic() - self.last_status_time < 1.5
+        fresh = self._status_fresh()
         scope_ok = self.tool_status.get('control_scope') == self.node.control_scope
         tool_type_ok = self.tool_status.get('tool_type') == self.node.selected_tool
         expected_ids = set(self.profile.get('actuator_ids', []))
@@ -1053,7 +1215,7 @@ class ManualMainWindow(QMainWindow):
 
     def _tool_enable_ready(self):
         """Readiness before torque is enabled; used only by ENABLE ID5."""
-        fresh = time.monotonic() - self.last_status_time < 1.5
+        fresh = self._status_fresh()
         return (fresh and bool(self.tool_status.get('bridge_connected'))
                 and bool(self.tool_status.get('online'))
                 and self.tool_status.get('position') is not None
@@ -1506,6 +1668,9 @@ class ManualMainWindow(QMainWindow):
         self._release_spur_hold()
         if self.dual_key_jog_timer.isActive():
             self._stop_dual_key_jog()
+        # A repeating timer keeps the window alive for the event loop; stop it
+        # so shutdown does not depend on Qt garbage-collection order.
+        self.watchdog.stop()
         super().closeEvent(event)
 
     def _log_key_trace(self, message):
@@ -1551,12 +1716,18 @@ class ManualMainWindow(QMainWindow):
         if self.dual_key_jog_timer.isActive():
             self._stop_dual_key_jog()
         self.pending_tool_change = requested
+        self.tool_change_requested = requested
+        self.pending_tool_change_started = self._clock()
+        self.pending_tool_change_link_ok = self._status_fresh()
+        self.tool_change_state = 'PENDING'
+        self.tool_change_detail = ''
         if not self.node.request_tool_change(requested):
-            self.pending_tool_change = None
-            self.tool_combo.setCurrentIndex(self.tool_combo.findData(current))
+            self._finish_tool_change(
+                'REJECTED', '요청을 발행하지 못했습니다 (GUI 안전 게이트)')
+            self._refresh_buttons()
             return
         self._refresh_buttons()
-        self._append_log(ko(f'도구 런타임 전환 요청: {requested}'))
+        self._append_log(ko(self._tool_change_message()))
 
     def _estop(self):
         self.node.emergency_stop()
@@ -1584,7 +1755,7 @@ class ManualMainWindow(QMainWindow):
         process.start()
 
     def _read_only_diagnostic(self):
-        if time.monotonic() - self.last_status_time < 1.5:
+        if self._status_fresh():
             self._append_log(
                 'Bridge already owns the serial bus; using /tool/status read-only '
                 f'diagnostics: {self.tool_status}')
