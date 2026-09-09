@@ -1,4 +1,4 @@
-"""로봇팔 미션 FSM 노드 (Phase 3, 구간2 구호물자 운반 중심).
+"""로봇팔 미션 FSM 노드 (Phase 3, 구간2 박스 운반 중심).
 
 설계 문서: `project_docs/PHASE3_FSM_설계.md` §4 상태표 / §5 핸드셰이크.
 구현 방식(결정 '가', 2026-06-29): **MoveIt 단일 경로**.
@@ -15,7 +15,7 @@
     2) 털털이 ID/방향/속도와 contact effort 임계값을 실기에서 확인해야 함.
     3) 카메라 frame → planning frame(base_link) **TF**가 있어야 MoveIt이 목표를 변환.
 
-2026-07-13 파워트레인 "계약 v2"(Notion `2026 국방로봇 자율주행 SW 전체 개발계획` §5.1/5.2)
+2026-07-13 파워트레인 "계약 v2"(Notion `자율주행 SW 개발계획` §5.1/5.2)
 반영 — status/mode 문자열과 트리거 조건을 아래처럼 갱신:
   - 작업 개시/하역 모두 **`/chassis_mode == MISSION_STOP` AND 같은 mission_id의
     `/arrival_status`** 를 순서 무관하게 둘 다 받아야 전이(`_try_advance`). 미인식
