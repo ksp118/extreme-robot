@@ -44,8 +44,7 @@ def generate_launch_description():
             'read_only': read_only,
             'tool_type': tool_type,
             'control_scope': control_scope,
-            'developer_direct_mode': ParameterValue(
-                developer_direct_mode, value_type=bool),
+            'developer_direct_mode': developer_direct_mode,
             'gripper_target_tolerance_ticks': gripper_tolerance,
             'temporary_jog_mode': temporary_jog_mode,
             'dual_single_motor_test_mode': dual_single_motor_test,
