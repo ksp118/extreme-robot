@@ -1465,9 +1465,10 @@ class MoveItDynamixelBridge(Node):
             self.packet_handler.reboot(self.port_handler, dxl_id)
             time.sleep(self.gripper_reboot_settle_s)
             # 기동 시와 같은 순서로 재설정. 하나라도 빠지면 다음 파지가 더 빨리 트립한다.
-            if not self._enable_torque(dxl_id, f"gripper(id {dxl_id}) 재부팅 후",
-                                       self.gripper_extended,
-                                       self.gripper_profile_velocity):
+            if not self._enable_torque(
+                    dxl_id, f"gripper(id {dxl_id}) 재부팅 후",
+                    self._required_gripper_mode(dxl_id),
+                    self.gripper_profile_velocity):
                 self.get_logger().error(
                     f"그리퍼(id={dxl_id}) 재부팅 후 토크 인가 실패 — 그리퍼가 죽은 "
                     "상태입니다. 스택을 재기동하세요.")
@@ -1485,28 +1486,13 @@ class MoveItDynamixelBridge(Node):
             self._gripper_recovering = False
             self.gripper_recovering_pub.publish(Bool(data=False))
 
-    def _recover_gripper_range(self, dxl_id, tick):
-        """캘리브 범위 밖으로 미끄러진 그리퍼를 열림 끝단으로 끌어낸다.
+    def _enable_torque(self, dxl_id, label, required_mode=None, velocity=None):
+        """현재 위치를 goal로 검증 동기화한 뒤에만 torque를 켠다.
 
-        ⚠️ 왜 매번 필요한가: `destroy_node()` 가 종료 시 전 ID 토크를 해제하는데,
-        그리퍼는 힘을 잃으면 닫힘 방향으로 미끄러져 **끝단을 지나쳐 버린다**(2026-08-12
-        실측: +1070 → -1259). 즉 스택을 재기동할 때마다 재발한다. 사람이 매번 손으로
-        PWM 을 올려 빼내는 건 현실적이지 않아 자동화했다.
-
-        복구는 파지 토크 상한(`gripper_goal_pwm`)을 **일시적으로** 올려서 한다 — 그
-        상한은 물체를 문 채 무한정 미는 걸 막는 장치지, 빈 그리퍼를 옮기는 데 필요한
-        힘까지 제한하려던 게 아니다. 실측으로 PWM 885 에서 1.5초 만에 끝나고 움직이는
-        중 전류는 40~90(무부하 수준)까지 떨어진다. 끝나면 반드시 원래 값으로 되돌린다.
+        실기 기준선의 급작스런 모션 방지 순서와 runtime tool profile의
+        operating-mode 검증을 함께 유지한다. 어떤 readback이든 다르면
+        torque는 OFF인 채로 남는다.
         """
-        # 끝단(open_tick) 자체를 겨냥하지 않는다 — 거기는 기구적 스토퍼라 밀어붙이면
-        # 랙이 미끄러진다(2026-08-12, 그때 오프셋이 통째로 ~1880 tick 이동했다).
-        # 범위 안쪽 15% 지점이면 "밖에서 안으로" 라는 목적은 그대로 달성하면서
-        # 스토퍼를 때리지 않는다.
-        span = self.gripper_open_tick - self.gripper_close_tick
-        target = int(self.gripper_open_tick - 0.15 * span)
-        self.get_logger().warn(
-            f"자동 복구 시도: Goal PWM {self.gripper_goal_pwm} → "
-            f"{self.gripper_recover_pwm} 로 일시 상향, tick {tick} → {target} 로 이동")
         try:
             with self._bus_lock:
                 torque = self._read_register(
@@ -1532,14 +1518,11 @@ class MoveItDynamixelBridge(Node):
                 goal_readback = self._read_register(
                     dxl_id, ADDR_GOAL_POSITION, 4,
                     "startup goal readback", signed=True)
-                # Startup synchronization is a fail-closed safety gate: even a
-                # one-tick mismatch means the value written was not read back
-                # exactly, so torque must remain disabled.
                 if goal_readback != present:
                     raise RuntimeError(
                         f"Present->Goal readback mismatch: "
                         f"present={present}, goal={goal_readback}")
-                self._write_motion_profile(dxl_id, label)
+                self._write_motion_profile(dxl_id, label, velocity)
                 self._write_register(
                     dxl_id, ADDR_TORQUE_ENABLE, 1,
                     TORQUE_ENABLE, "startup torque enable")
@@ -1555,6 +1538,64 @@ class MoveItDynamixelBridge(Node):
             return False
         self.get_logger().info(f"Torque enabled safely: {label} -> id {dxl_id}")
         return True
+
+    def _recover_gripper_range(self, dxl_id, tick):
+        """캘리브 범위 밖으로 미끄러진 그리퍼를 열림 끝단으로 끌어낸다.
+
+        ⚠️ 왜 매번 필요한가: `destroy_node()` 가 종료 시 전 ID 토크를 해제하는데,
+        그리퍼는 힘을 잃으면 닫힘 방향으로 미끄러져 **끝단을 지나쳐 버린다**(2026-08-12
+        실측: +1070 → -1259). 즉 스택을 재기동할 때마다 재발한다. 사람이 매번 손으로
+        PWM 을 올려 빼내는 건 현실적이지 않아 자동화했다.
+
+        복구는 파지 토크 상한(`gripper_goal_pwm`)을 **일시적으로** 올려서 한다 — 그
+        상한은 물체를 문 채 무한정 미는 걸 막는 장치지, 빈 그리퍼를 옮기는 데 필요한
+        힘까지 제한하려던 게 아니다. 실측으로 PWM 885 에서 1.5초 만에 끝나고 움직이는
+        중 전류는 40~90(무부하 수준)까지 떨어진다. 끝나면 반드시 원래 값으로 되돌린다.
+        """
+        # 끝단(open_tick) 자체를 겨냥하지 않는다 — 거기는 기구적 스토퍼라 밀어붙이면
+        # 랙이 미끄러진다(2026-08-12, 그때 오프셋이 통째로 ~1880 tick 이동했다).
+        # 범위 안쪽 15% 지점이면 "밖에서 안으로" 라는 목적은 그대로 달성하면서
+        # 스토퍼를 때리지 않는다.
+        span = self.gripper_open_tick - self.gripper_close_tick
+        target = int(self.gripper_open_tick - 0.15 * span)
+        self.get_logger().warn(
+            f"자동 복구 시도: Goal PWM {self.gripper_goal_pwm} → "
+            f"{self.gripper_recover_pwm} 로 일시 상향, tick {tick} → {target} 로 이동")
+        try:
+            with self._bus_lock:
+                self.packet_handler.write2ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_GOAL_PWM,
+                    self.gripper_recover_pwm)
+                self.packet_handler.write4ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_GOAL_POSITION,
+                    target & 0xFFFFFFFF)
+                deadline = time.time() + self.gripper_recover_timeout
+                reached = False
+                while time.time() < deadline:
+                    time.sleep(0.2)
+                    pos, result, error = self.packet_handler.read4ByteTxRx(
+                        self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
+                    if result != 0 or error != 0:
+                        continue
+                    now = to_signed(pos, LEN_PRESENT_POSITION)
+                    if abs(now - target) <= 40:
+                        reached = True
+                        break
+        finally:
+            # 성공하든 실패하든 상한을 돌려놓는다. 높은 PWM으로 파지하면
+            # Overload 트립 위험이 다시 생긴다.
+            with self._bus_lock:
+                self.packet_handler.write2ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_GOAL_PWM,
+                    self.gripper_goal_pwm)
+        if reached:
+            self.get_logger().info(
+                f"자동 복구 성공 — 그리퍼가 범위 안({target})으로 복귀. "
+                f"Goal PWM {self.gripper_goal_pwm} 복원됨.")
+        else:
+            self.get_logger().error(
+                "자동 복구 실패 — 그리퍼가 여전히 범위 밖입니다. 기구적 걸림일 수 "
+                "있으니 손으로 확인하세요(파지 판정을 신뢰하지 말 것).")
 
     def _joint_center(self, joint_name):
         return self.centers.get(joint_name, JOINT_CONFIG[joint_name]['center'])
