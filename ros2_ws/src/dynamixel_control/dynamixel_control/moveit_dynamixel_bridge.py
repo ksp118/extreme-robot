@@ -2500,11 +2500,55 @@ class MoveItDynamixelBridge(Node):
                 f"Cleaning actuator velocity-mode setup failed: id={dxl_id}: {exc}")
             self.cleaning_configured = False
             return
-        if self._enable_torque(dxl_id, self.cleaning_actuator_joint):
+        if self._enable_cleaner_torque(dxl_id):
             self.group_sync_read.addParam(dxl_id)
             self.active_ids.add(dxl_id)
         else:
             self.cleaning_configured = False
+
+    def _enable_cleaner_torque(self, dxl_id):
+        """Enable a velocity-mode cleaner without position-goal synchronization."""
+        try:
+            with self._bus_lock:
+                if self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1,
+                        'cleaner torque preflight') != TORQUE_DISABLE:
+                    raise RuntimeError('cleaner torque must be OFF before setup')
+                if self._read_register(
+                        dxl_id, ADDR_OPERATING_MODE, 1,
+                        'cleaner velocity mode readback') != 1:
+                    raise RuntimeError('cleaner operating mode is not velocity control')
+                for address, value, label in (
+                        (ADDR_PROFILE_ACCELERATION,
+                         int(self.tool_profile['profile_acceleration']),
+                         'cleaner profile acceleration'),
+                        (ADDR_PROFILE_VELOCITY,
+                         int(self.tool_profile['profile_velocity']),
+                         'cleaner profile velocity')):
+                    self._write_register(dxl_id, address, 4, value, label)
+                    if self._read_register(
+                            dxl_id, address, 4, f'{label} readback') != value:
+                        raise RuntimeError(f'{label} readback mismatch')
+                # Recheck immediately before torque-on; nothing may have
+                # restored an old non-zero speed during the setup sequence.
+                if self._read_register(
+                        dxl_id, ADDR_GOAL_VELOCITY, 4,
+                        'cleaner goal velocity preflight', signed=True) != 0:
+                    raise RuntimeError('cleaner goal velocity is not zero')
+                self._write_register(
+                    dxl_id, ADDR_TORQUE_ENABLE, 1, TORQUE_ENABLE,
+                    'cleaner torque enable')
+                if self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1,
+                        'cleaner torque enable readback') != TORQUE_ENABLE:
+                    raise RuntimeError('cleaner torque enable readback failed')
+        except Exception as exc:
+            self.get_logger().error(
+                f'Cleaning torque enable blocked: id={dxl_id}: {exc}')
+            return False
+        self.torque_enabled_ids.add(int(dxl_id))
+        self.get_logger().info(f'Cleaning torque enabled safely: id={dxl_id}')
+        return True
 
     def _cleaner_direction_command(self, command):
         if command == 'STOP':

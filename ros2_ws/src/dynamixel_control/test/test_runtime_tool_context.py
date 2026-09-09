@@ -62,4 +62,9 @@ def test_cleaner_setup_zeros_velocity_before_torque_enable():
     end = text.index('    def _cleaner_direction_command', start)
     setup = text[start:end]
     assert "'cleaner zero goal velocity'" in setup
-    assert setup.index("'cleaner zero goal velocity'") < setup.index('_enable_torque')
+    assert setup.index("'cleaner zero goal velocity'") < setup.index('_enable_cleaner_torque')
+    source_text = source.read_text()
+    cleaner_enable = source_text[source_text.index('    def _enable_cleaner_torque'):
+                                 source_text.index('    def _cleaner_direction_command')]
+    assert 'ADDR_GOAL_VELOCITY' in cleaner_enable
+    assert 'ADDR_GOAL_POSITION' not in cleaner_enable
