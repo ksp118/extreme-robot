@@ -388,9 +388,19 @@ class ManualMainWindow(QMainWindow):
             self.hold_close_button = QPushButton(ko('HOLD TO CLOSE'))
             self.common_enable = QPushButton('활성화')
             self.common_disable = QPushButton('비활성화')
-            self.open_button.clicked.connect(lambda: self._common_action(2))
-            self.close_button.clicked.connect(lambda: self._common_action(1))
-            self.tool_stop.clicked.connect(self._stop_tool)
+            # Cleaner direction must leave the GUI on mouse/key press, not on
+            # Qt's clicked signal (which fires only after release).  The same
+            # shared buttons retain release-click behaviour for grippers.
+            self.open_button.pressed.connect(
+                lambda: self._common_pressed(2))
+            self.close_button.pressed.connect(
+                lambda: self._common_pressed(1))
+            self.open_button.clicked.connect(
+                lambda: self._common_clicked(2))
+            self.close_button.clicked.connect(
+                lambda: self._common_clicked(1))
+            self.tool_stop.pressed.connect(self._tool_stop_pressed)
+            self.tool_stop.clicked.connect(self._tool_stop_clicked)
             self.common_enable.clicked.connect(lambda: self._common_torque(True))
             self.common_disable.clicked.connect(lambda: self._common_torque(False))
             self.hold_open_button.pressed.connect(lambda: self._common_hold('OPEN'))
@@ -660,6 +670,24 @@ class ManualMainWindow(QMainWindow):
                 self._append_log(f'청소기 즉시 {"좌회전" if command == "LEFT" else "우회전"} 요청')
             return
         self.node.command_tool_fsm(command)
+
+    def _common_pressed(self, number):
+        """Send cleaner direction at physical button/key depression."""
+        if self.node.selected_tool == 'cleaner':
+            self._common_action(number)
+
+    def _common_clicked(self, number):
+        """Keep the gripper buttons' historical release-click behaviour."""
+        if self.node.selected_tool != 'cleaner':
+            self._common_action(number)
+
+    def _tool_stop_pressed(self):
+        if self.node.selected_tool == 'cleaner':
+            self._stop_tool()
+
+    def _tool_stop_clicked(self):
+        if self.node.selected_tool != 'cleaner':
+            self._stop_tool()
 
     def _refresh_common_buttons(self):
         self._refresh_legacy_common_buttons()

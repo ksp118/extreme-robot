@@ -337,3 +337,13 @@ def test_block_reason_names_the_active_latch():
             '선택 도구와 연결 모터 번호가 다름 (감지: 5, 기대: 2)')
     finally:
         window.close()
+
+
+def test_cleaner_common_buttons_send_on_press_not_release():
+    from pathlib import Path
+
+    source = (Path(__file__).parents[1] / 'robot_manual_gui/main_window.py').read_text()
+    assert 'self.open_button.pressed.connect' in source
+    assert 'self.close_button.pressed.connect' in source
+    assert 'self.tool_stop.pressed.connect' in source
+    assert 'def _common_pressed' in source
