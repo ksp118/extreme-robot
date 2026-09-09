@@ -552,8 +552,13 @@ def test_spur_enable_uses_current_context_before_motion_allowed():
         assert window.control_mode == window.node.control_mode == 'MANUAL'
         assert window.common_enable.isEnabled()
         assert not window.open_button.isEnabled()
+        status['fsm_state'] = 'STOPPED'
+        window._update_tool_status(status)
+        assert window.common_enable.isEnabled()
+        assert not window.open_button.isEnabled()
         window.common_enable.click()
         assert commands == ['manual_enable']
+        status['fsm_state'] = 'READY'
         status['actuators'][0]['torque_state'] = 'ON'
         # Deliberately leave motion_allowed false: torque readback is authoritative.
         window._update_tool_status(status)

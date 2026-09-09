@@ -579,7 +579,7 @@ class ManualMainWindow(QMainWindow):
                     and not status.get('read_only') and not getattr(self.node, 'read_only', False)
                     and not status.get('emergency_stop') and not status.get('tool_detached')
                     and sample.get('online') and sample.get('hardware_error') == 0
-                    and self.fsm_state in ('READY', 'OPEN', 'CLOSED'))
+                    and self.fsm_state in ('STOPPED', 'READY', 'OPEN', 'CLOSED'))
 
     def _common_action(self, number):
         if self.pending_tool_change:
@@ -626,7 +626,8 @@ class ManualMainWindow(QMainWindow):
         torque_on = sample.get('torque_state') == 'ON'
         # Torque-off readiness must never depend on motion_allowed or calibration-session state.
         self.common_enable.setEnabled(ready and not torque_on)
-        motion = ready and torque_on
+        motion = (ready and torque_on
+                  and self.fsm_state in ('READY', 'OPEN', 'CLOSED'))
         for widget in (self.open_button, self.close_button,
                        self.hold_open_button, self.hold_close_button):
             widget.setEnabled(motion)
@@ -1158,6 +1159,7 @@ class ManualMainWindow(QMainWindow):
 
     def _spur_manual_ready(self):
         return (self._spur_enable_ready()
+                and self.fsm_state in ('READY', 'OPEN', 'CLOSED')
                 and self._gripper_samples().get(5, {}).get('torque_state') == 'ON')
 
     def _common_motion_ready(self):
