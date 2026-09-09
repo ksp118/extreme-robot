@@ -329,7 +329,8 @@ class ManualMainWindow(QMainWindow):
                 'spur_zero', 'spur_plus_5', 'motor_minus_half', 'motor_plus_half',
                 'motor_minus_one', 'motor_plus_one', 'developer_direct_box',
                 'developer_enable', 'developer_disable', 'developer_minus',
-                'developer_plus', 'developer_hold'):
+                'developer_plus', 'developer_minus_five',
+                'developer_plus_five', 'developer_hold'):
             setattr(self, name, None)
         box = QGroupBox(ko('End Effector'))
         layout = QVBoxLayout(box)
@@ -353,6 +354,8 @@ class ManualMainWindow(QMainWindow):
             self.developer_hold = QPushButton(ko('현재 위치 정지'))
             self.developer_minus = QPushButton(ko('−0.5°'))
             self.developer_plus = QPushButton(ko('+0.5°'))
+            self.developer_minus_five = QPushButton(ko('−5° 크게 이동'))
+            self.developer_plus_five = QPushButton(ko('+5° 크게 이동'))
             self.developer_enable.clicked.connect(
                 lambda: self._developer_spur_command('manual_enable'))
             self.developer_disable.clicked.connect(
@@ -363,11 +366,17 @@ class ManualMainWindow(QMainWindow):
                 lambda: self._developer_spur_command('manual_step', -0.5))
             self.developer_plus.clicked.connect(
                 lambda: self._developer_spur_command('manual_step', 0.5))
+            self.developer_minus_five.clicked.connect(
+                lambda: self._developer_spur_command('manual_step', -5.0))
+            self.developer_plus_five.clicked.connect(
+                lambda: self._developer_spur_command('manual_step', 5.0))
             developer.addWidget(self.developer_enable, 1, 0)
             developer.addWidget(self.developer_disable, 1, 1)
             developer.addWidget(self.developer_hold, 1, 2)
             developer.addWidget(self.developer_minus, 2, 0, 1, 2)
             developer.addWidget(self.developer_plus, 2, 2)
+            developer.addWidget(self.developer_minus_five, 3, 0, 1, 2)
+            developer.addWidget(self.developer_plus_five, 3, 2)
             layout.addWidget(self.developer_direct_box)
         if not hasattr(self, 'common_enable'):
             self.open_button = QPushButton(ko('OPEN'))
@@ -1228,6 +1237,8 @@ class ManualMainWindow(QMainWindow):
         self.developer_hold.setEnabled(ready and torque_on)
         self.developer_minus.setEnabled(ready and torque_on)
         self.developer_plus.setEnabled(ready and torque_on)
+        self.developer_minus_five.setEnabled(ready and torque_on)
+        self.developer_plus_five.setEnabled(ready and torque_on)
 
     def _spur_manual_ready(self):
         return (self._spur_enable_ready()

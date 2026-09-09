@@ -53,7 +53,9 @@ def test_developer_direct_mode_bypasses_fsm_ownership_but_not_hardware_gates():
     b.tool_profile.update(safe_min_tick=100, safe_max_tick=200, calibrated=False)
     c.command('manual_step', 0.5)
     assert b.position == 156
+    c.command('manual_step', 5.0)
+    assert b.position == 200
     b.emergency_stop_active = True
     with pytest.raises(RuntimeError):
         c.command('manual_step', 0.5)
-    assert b.position == 156
+    assert b.position == 200

@@ -602,6 +602,8 @@ def test_developer_direct_panel_uses_id5_without_manual_or_fsm_ownership():
         assert window.developer_minus.isEnabled()
         window.developer_minus.click()
         assert commands[-1] == ('manual_step', {'delta_deg': -0.5})
+        window.developer_plus_five.click()
+        assert commands[-1] == ('manual_step', {'delta_deg': 5.0})
         status['emergency_stop'] = True
         window._update_tool_status(status)
         assert not window.developer_plus.isEnabled()

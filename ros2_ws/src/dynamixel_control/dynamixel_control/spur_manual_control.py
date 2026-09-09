@@ -53,7 +53,9 @@ class SpurManualControl:
             endpoint = targets['open' if command == 'manual_open' else 'close']
             target = current + max(-6, min(6, endpoint - current))
         elif command == 'manual_step':
-            if float(delta_deg) not in (-1.0, -0.5, 0.5, 1.0):
+            allowed_steps = ((-5.0, -1.0, -0.5, 0.5, 1.0, 5.0)
+                             if developer_direct else (-1.0, -0.5, 0.5, 1.0))
+            if float(delta_deg) not in allowed_steps:
                 raise RuntimeError('unsupported ID5 manual step')
             target = current + round(float(delta_deg) * 4096 / 360)
         else:
