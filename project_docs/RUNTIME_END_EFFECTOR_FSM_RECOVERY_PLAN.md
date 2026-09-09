@@ -7,6 +7,26 @@
 > 요구사항 주의: 로컬에 `docs/requirements/요구사항.md`가 없어 현재 코드, 기존 프로젝트 문서,
 > 8월 19일 커밋 메시지와 이번 실행 검증을 근거로 한다.
 
+## 구현 진행 기록 (2026-09-09)
+
+현재 통합 브랜치 `codex/backend-tool-fsm-recovery`에서 다음 항목까지 구현·검증했다.
+
+- `824819b`: 8월 실기 기준 팔 FSM 및 브리지 기동 안전 경로 복구
+- `fb3667f`: Claude의 GUI 요청 timeout/cancel/연결단절 복구와 Qt 정상 종료 반영
+- `5396f58`: 캘리브레이션 파라미터 런타임 반영 callback 복구
+- `617f470`: MoveIt용 `/joint_states`와 런타임 도구용 `/tool/joint_states` 분리
+- `8f86437`: `f3229a9` 병합에서 손상된 dual URDF를 `656b2cd` 검증본으로 복구하고 구조 테스트 추가
+- `9e51335`: `{3,4}`/`{5}` read-only ping 서명, 연속 확인, 물리 탈거 latch,
+  안전한 팔 FSM 상태에서의 자동 profile/FSM 전환 연결
+
+검증 결과는 관련 백엔드 회귀 65건과 GUI 파일별 격리 실행 59건이 통과했다. 실제 launch에서도
+`dual → spur` 후 arm-only joint stream과 tool joint stream이 분리됐고 `/compute_fk` 성공 및
+`move_group` 생존을 확인했다.
+
+아직 완료로 간주하지 않는 항목은 USB 실기 왕복 시험, cleaner의 물리 ID 확정,
+`simulation_ready`/`hardware_ready` 표시 분리다. 현재 dual 구동 정책은 사용자가 실기 정상이라고
+확인한 현행 코드를 보존했으며, 이 문서 초안의 ID3-only 회귀 제안으로 되돌리지 않았다.
+
 ---
 
 ## 1. 개발 원칙
