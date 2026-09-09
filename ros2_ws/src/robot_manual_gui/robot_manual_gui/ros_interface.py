@@ -83,6 +83,7 @@ class ManualGuiNode(Node):
         self.detach_pub = self.create_publisher(Bool, '/tool/detached', 10)
         self.mode_pub = self.create_publisher(String, '/control/mode', 10)
         self.fsm_command_pub = self.create_publisher(String, '/tool/fsm_command', 10)
+        self.tool_change_pub = self.create_publisher(String, '/tool/change', 10)
         self.calibration_command_pub = self.create_publisher(
             String, '/tool/calibration_command', 10)
         self.torque_pub = self.create_publisher(
@@ -154,6 +155,8 @@ class ManualGuiNode(Node):
                 joint: {'position': float(target_rad), 'effort': 0.0}})
 
     def command_gripper(self, position):
+        if self.selected_tool not in ('spur_1motor_gripper', 'dual_motor_gripper'):
+            return False
         if self.read_only:
             self.signals.log.emit('Gripper command blocked: GUI is read-only')
             return False
@@ -184,7 +187,9 @@ class ManualGuiNode(Node):
         self.get_logger().info(
             f'Sending gripper goal: logical_position={float(position):.9f}')
         future = self.gripper.send_goal_async(goal)
-        future.add_done_callback(self._gripper_goal_response)
+        context = getattr(self, 'tool_context_generation', 0)
+        future.add_done_callback(lambda result: self._gripper_goal_response(result)
+                                 if context == getattr(self, 'tool_context_generation', 0) else None)
         return True
 
     def set_spur_motor_enabled(self, enabled):
@@ -205,15 +210,30 @@ class ManualGuiNode(Node):
         self.command_calibration(command)
         return True
 
-    def command_spur_fsm(self, command):
+    def command_tool_fsm(self, command):
         if self.read_only:
             self.signals.log.emit('FSM command blocked: GUI is read-only')
             return False
-        if (self.selected_tool != 'spur_1motor_gripper'
+        if (self.selected_tool not in (
+                    'spur_1motor_gripper', 'dual_motor_gripper')
                 or self.control_scope != 'END_EFFECTOR_ONLY'):
             return False
         self.fsm_command_pub.publish(String(data=str(command).upper()))
         return True
+
+    def request_tool_change(self, tool_type):
+        """Request a bridge-owned runtime profile/FSM switch."""
+        requested = str(tool_type).strip()
+        if requested not in ('spur_1motor_gripper', 'dual_motor_gripper', 'cleaner'):
+            return False
+        self.tool_change_pub.publish(String(data=requested))
+        return True
+
+    def command_spur_fsm(self, command):
+        """Compatibility name retained for existing ID5 GUI/tests."""
+        if self.selected_tool != 'spur_1motor_gripper':
+            return False
+        return self.command_tool_fsm(command)
 
     def command_calibration(self, command, **values):
         if self.read_only:
@@ -281,8 +301,10 @@ class ManualGuiNode(Node):
                 return
             self.signals.log.emit('Gripper action accepted')
             self.signals.gripper_state.emit(True, 'ACTIVE')
+            context = getattr(self, 'tool_context_generation', 0)
             self.last_gripper_goal.get_result_async().add_done_callback(
-                self._gripper_result)
+                lambda result: self._gripper_result(result)
+                if context == getattr(self, 'tool_context_generation', 0) else None)
         except Exception as exc:
             self.signals.log.emit(f'Gripper action error: {exc}')
             self._set_gripper_idle('ERROR')
@@ -333,6 +355,8 @@ class ManualGuiNode(Node):
             self._set_gripper_idle('STOP_ERROR')
 
     def command_cleaner(self, enabled):
+        if self.read_only or self.selected_tool != 'cleaner':
+            return False
         if self.control_mode != 'MANUAL':
             self.signals.log.emit('Cleaner command blocked: ownership is not MANUAL')
             return

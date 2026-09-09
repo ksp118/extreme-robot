@@ -29,6 +29,8 @@ class Bridge:
             4: {'position': 20, 'torque': 1, 'hardware_error': 0, 'model': 1060},
         }
         self.jogs = []
+        self.holds = []
+        self.pair_jogs = []
 
     def read_dual_calibration_state(self):
         return deepcopy(self.state)
@@ -36,6 +38,16 @@ class Bridge:
     def dual_calibration_jog(self, dxl_id, delta_deg):
         self.jogs.append((dxl_id, delta_deg))
         return self.state[dxl_id]['position']
+
+    def dual_calibration_hold(self):
+        positions = {dxl_id: sample['position']
+                     for dxl_id, sample in self.state.items()}
+        self.holds.append(positions)
+        return positions
+
+    def dual_calibration_pair_jog(self, delta_deg):
+        self.pair_jogs.append(delta_deg)
+        return {3: 10, 4: 20}
 
 
 def capture_pair(session, bridge, label, id3, id4):
@@ -111,3 +123,21 @@ def test_only_configured_one_click_steps_are_forwarded_to_selected_motor():
     assert bridge.jogs == [(3, 5.0)]
     with pytest.raises(DualCalibrationError):
         session.jog_motor_degrees(4, 0.25)
+
+
+def test_pair_jog_uses_one_guarded_bridge_operation():
+    bridge = Bridge()
+    session = DualCalibrationSession(bridge, PROFILE)
+    session.start()
+    assert session.jog_pair_degrees(-0.5) == {3: 10, 4: 20}
+    assert bridge.pair_jogs == [-0.5]
+
+
+def test_hold_requires_active_healthy_session_and_holds_both_positions():
+    bridge = Bridge()
+    session = DualCalibrationSession(bridge, PROFILE)
+    with pytest.raises(DualCalibrationError):
+        session.hold()
+    session.start()
+    assert session.hold() == {3: 10, 4: 20}
+    assert bridge.holds == [{3: 10, 4: 20}]
