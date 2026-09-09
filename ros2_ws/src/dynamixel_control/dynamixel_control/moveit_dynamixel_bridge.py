@@ -740,6 +740,14 @@ class MoveItDynamixelBridge(Node):
         # _bus_lock, so feedback cannot corrupt a packet while policy/FSM work
         # in the normal command queue cannot delay the operator's button.
         self._cleaner_direct_group = ReentrantCallbackGroup()
+        # Latest-command-wins mailbox for the bench cleaner.  A new button
+        # press never waits behind older LEFT/RIGHT requests; the active
+        # writer drains only the newest requested velocity after its current
+        # single serial transaction completes.
+        self._cleaner_command_state_lock = threading.Lock()
+        self._cleaner_command_active = False
+        self._cleaner_command_generation = 0
+        self._cleaner_requested_velocity = 0
 
         self.trajectory_sub = self.create_subscription(
             JointTrajectory,
@@ -2703,22 +2711,59 @@ class MoveItDynamixelBridge(Node):
             return
         velocity = (rotation * self.cleaning_direction * self.cleaning_velocity_raw
                     if msg.data else 0)
+        self._submit_cleaner_velocity(int(velocity))
+
+    def _submit_cleaner_velocity(self, velocity):
+        """Preempt older cleaner requests; perform only the latest write.
+
+        The callback that owns the mailbox may be writing one Protocol 2.0
+        packet already.  Concurrent button presses only replace the desired
+        velocity, then that owner loops once more with the newest value.  This
+        makes STOP and direction changes interruptible without concurrent
+        writes to the serial port.
+        """
+        with self._cleaner_command_state_lock:
+            self._cleaner_command_generation += 1
+            self._cleaner_requested_velocity = int(velocity)
+            if self._cleaner_command_active:
+                return
+            self._cleaner_command_active = True
+        completed = False
         try:
-            # publish_joint_states(), signature detection and GUI commands all
-            # share this Protocol 2.0 port.  Without the same lock used by the
-            # readers, a velocity command intermittently returns COMM_PORT_BUSY
-            # (-1000) even though the cleaner is online and torque-enabled.
-            with self._bus_lock:
-                self._write_register(
-                    self.cleaning_actuator_id, ADDR_GOAL_VELOCITY, 4,
-                    velocity & 0xffffffff, 'cleaner goal velocity')
-        except Exception as exc:
-            self.get_logger().error(
-                f'Cleaning velocity write failed: {exc}')
-            return
-        self.cleaning_running = bool(msg.data)
-        if isinstance(self.tool_fsm, CleanerFSM):
-            self.tool_fsm.observe_command(msg.data)
+            while True:
+                with self._cleaner_command_state_lock:
+                    generation = self._cleaner_command_generation
+                    requested = self._cleaner_requested_velocity
+                    actuator_id = self.cleaning_actuator_id
+                if (self.tool_type != 'cleaner'
+                        or actuator_id < 0 or not self.cleaning_configured):
+                    return
+                try:
+                    # This remains serialized with feedback and detection,
+                    # but no stale motion command can be queued behind it.
+                    with self._bus_lock:
+                        self._write_register(
+                            actuator_id, ADDR_GOAL_VELOCITY, 4,
+                            requested & 0xffffffff,
+                            'cleaner goal velocity')
+                except Exception as exc:
+                    self.get_logger().error(
+                        f'Cleaning velocity write failed: {exc}')
+                    return
+                self.cleaning_running = bool(requested)
+                if isinstance(self.tool_fsm, CleanerFSM):
+                    self.tool_fsm.observe_command(bool(requested))
+                with self._cleaner_command_state_lock:
+                    if generation == self._cleaner_command_generation:
+                        self._cleaner_command_active = False
+                        completed = True
+                        return
+        finally:
+            # Covers exceptions/early returns before the normal completion
+            # path.  Holding the state lock closes the submit-vs-release race.
+            if not completed:
+                with self._cleaner_command_state_lock:
+                    self._cleaner_command_active = False
 
     def rad_to_tick(self, joint_name, rad):
         """관절 rad → 서보 tick. 안전 리밋 clamp 후 기어비를 곱해 서보축 도메인으로 올린다.

@@ -128,3 +128,14 @@ def test_cleaner_direction_buttons_use_the_interrupt_ingress():
                         text.index('Bool, "/tool/emergency_stop"')]
     assert 'callback_group=self._cleaner_direct_group' in subscription
     assert 'def _on_cleaning_direction' in text
+
+
+def test_cleaner_direction_mailbox_preempts_older_commands():
+    source = Path(__file__).parents[1] / 'dynamixel_control/moveit_dynamixel_bridge.py'
+    text = source.read_text()
+    start = text.index('    def _submit_cleaner_velocity')
+    end = text.index('    def rad_to_tick', start)
+    mailbox = text[start:end]
+    assert '_cleaner_command_generation' in mailbox
+    assert '_cleaner_requested_velocity' in mailbox
+    assert 'generation == self._cleaner_command_generation' in mailbox
