@@ -21,7 +21,7 @@ from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite, GroupSyncR
 from ament_index_python.packages import get_package_share_directory
 
 from dynamixel_control.tool_manager import (
-    ParameterToolIdentityProvider, ToolManager)
+    BusToolIdentityProvider, ParameterToolIdentityProvider, ToolManager)
 from dynamixel_control.tool_fsm.cleaner_fsm import CleanerFSM
 from dynamixel_control.spur_manual_control import SpurManualControl
 from dynamixel_control.tool_profiles import (
@@ -373,6 +373,9 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("read_only", False)
         self.declare_parameter("mock_mode", False)
         self.declare_parameter("tool_type", "spur_1motor_gripper")
+        self.declare_parameter("auto_tool_detection", True)
+        self.declare_parameter("tool_detection_confirmations", 2)
+        self.declare_parameter("tool_detection_period_s", 0.25)
         self.declare_parameter("control_scope", "FULL_ROBOT")
         self.declare_parameter("temporary_jog_mode", False)
         self.declare_parameter("temporary_jog_safe_min_tick", 2867)
@@ -446,9 +449,24 @@ class MoveItDynamixelBridge(Node):
         self.read_only = bool(self.get_parameter("read_only").value)
         self.mock_mode = bool(self.get_parameter("mock_mode").value)
         self.tool_type = str(self.get_parameter("tool_type").value)
+        self.auto_tool_detection = bool(
+            self.get_parameter('auto_tool_detection').value)
+        self.tool_detection_confirmations = int(
+            self.get_parameter('tool_detection_confirmations').value)
+        self.tool_detection_period_s = float(
+            self.get_parameter('tool_detection_period_s').value)
+        if self.tool_detection_confirmations < 1:
+            raise ValueError('tool_detection_confirmations must be positive')
+        if self.tool_detection_period_s <= 0.0:
+            raise ValueError('tool_detection_period_s must be positive')
         self._tool_change_lock = threading.Lock()
         self._tool_change_pending = None
         self._tool_change_error = ''
+        self._physical_tool_detached = False
+        self._tool_detection_observation = None
+        self._tool_detection_count = 0
+        self._tool_detection_reason = ''
+        self._arm_fsm_state = None
         self.control_scope = validate_control_scope(
             self.get_parameter("control_scope").value)
         # The isolated end-effector stack must never poll or command arm IDs.
@@ -484,6 +502,7 @@ class MoveItDynamixelBridge(Node):
         try:
             profiles = load_profiles(
                 self.get_parameter('tool_profile_file').value)
+            self._tool_profiles = profiles
             self.tool_manager = ToolManager(
                 profiles, ParameterToolIdentityProvider(self.tool_type),
                 mock_mode=self.mock_mode)
@@ -496,6 +515,7 @@ class MoveItDynamixelBridge(Node):
             self.tool_selection = None
             self.tool_profile = {}
             self.tool_motion_allowed = False
+            self._tool_profiles = {}
         if self.tool_profile.get('mock_only') and not self.mock_mode:
             raise RuntimeError('mock_only profiles cannot open physical hardware')
         self.control_mode = 'FSM'
@@ -712,6 +732,8 @@ class MoveItDynamixelBridge(Node):
             String, "/control/mode_status", self._on_control_mode, 10)
         self.create_subscription(
             String, "/control/mode", self._on_control_mode_request, 10)
+        self.create_subscription(
+            String, '/fsm/state', self._on_arm_fsm_state, 10)
 
         # 벤치 teleop_core의 단일 관절 명령. 메시지는 [motor_id, goal_tick].
         # FSM/MoveIt 경로와 같은 GroupSyncWrite를 사용하되 알려진 팔 ID만 허용한다.
@@ -829,6 +851,14 @@ class MoveItDynamixelBridge(Node):
         self.tool_status_timer = self.create_timer(
             0.5, self._publish_tool_status_safely,
             callback_group=ReentrantCallbackGroup())
+        self._bus_tool_identity = None
+        if self.auto_tool_detection and not self.mock_mode and self.port_connected:
+            self._bus_tool_identity = BusToolIdentityProvider(
+                self._tool_profiles, self._probe_tool_id,
+                excluded_ids={config['id'] for config in JOINT_CONFIG.values()})
+            self.create_timer(
+                self.tool_detection_period_s, self._poll_physical_tool,
+                callback_group=ReentrantCallbackGroup())
 
         self.get_logger().info(
             f"MoveIt Dynamixel bridge started (arm={list(JOINT_CONFIG)}, "
@@ -1802,6 +1832,110 @@ class MoveItDynamixelBridge(Node):
             return False
         return True
 
+    def _probe_tool_id(self, dxl_id):
+        """Ping one candidate under the shared serial-bus lock."""
+        with self._bus_lock:
+            _model, result, error = self.packet_handler.ping(
+                self.port_handler, int(dxl_id))
+        return result == 0 and error == 0
+
+    def _confirmed_tool_observation(self, detected):
+        """Return true once one observation is stable for the configured count."""
+        if detected != self._tool_detection_observation:
+            self._tool_detection_observation = detected
+            self._tool_detection_count = 1
+        else:
+            self._tool_detection_count += 1
+        return self._tool_detection_count >= self.tool_detection_confirmations
+
+    def _automatic_switch_safe(self):
+        if self._gripper_goal_active:
+            return False
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            return True
+        return self._arm_fsm_state in ToolManager.SAFE_CHANGE_STATES
+
+    def _poll_physical_tool(self):
+        """Fail closed on detach, then switch only after a stable new signature."""
+        provider = self._bus_tool_identity
+        if provider is None or self.mock_mode or not self.port_connected:
+            return
+        if self.tool_type not in provider.supported_tool_types:
+            self._tool_detection_reason = (
+                f'{self.tool_type} has no physical actuator signature')
+            return
+        detected = provider.detected_tool_type()
+        if not self._confirmed_tool_observation(detected):
+            return
+
+        if not self._physical_tool_detached:
+            if detected == self.tool_type:
+                self._tool_detection_reason = ''
+                return
+            # A different/ambiguous signature cannot switch directly.  First
+            # latch physical removal and stop the selected tool fail-closed.
+            if not self._tool_change_lock.acquire(blocking=False):
+                return
+            try:
+                self._physical_tool_detached = True
+                self.tool_discovered = False
+                self._tool_detection_reason = provider.last_reason or (
+                    f'physical tool changed: {self.tool_type}->{detected}')
+                self._stop_tool('physical end-effector removal detected')
+                self._tool_detection_observation = None
+                self._tool_detection_count = 0
+            finally:
+                self._tool_change_lock.release()
+            return
+
+        if detected is None:
+            self._tool_detection_reason = provider.last_reason
+            return
+        if self.tool_detached or self.emergency_stop_active:
+            self._tool_detection_reason = 'automatic switch blocked by safety latch'
+            return
+        if not self._automatic_switch_safe():
+            self._tool_detection_reason = (
+                f'automatic switch waiting for safe arm state; '
+                f'current={self._arm_fsm_state or "UNKNOWN"}')
+            return
+        if not self._tool_change_lock.acquire(blocking=False):
+            return
+        try:
+            self._tool_change_pending = detected
+            self._tool_change_error = ''
+            try:
+                if detected == self.tool_type:
+                    # A same-type reattachment is observation-only.  Restore
+                    # registration/FSM validation but never re-enable torque.
+                    self.tool_discovered = self._discover_tool_ids()
+                    if not self.tool_discovered:
+                        raise RuntimeError('reattached tool discovery failed')
+                    for dxl_id in self.tool_ids:
+                        self.group_sync_read.addParam(dxl_id)
+                        self.active_ids.add(dxl_id)
+                    self.tool_motion_allowed = bool(
+                        self.tool_selection and self.tool_selection.valid)
+                    if self.tool_fsm is not None:
+                        state = self.tool_fsm.startup()
+                        if state == ToolState.FAULT:
+                            raise RuntimeError(
+                                self.tool_fsm.fault_reason or
+                                'reattached tool validation failed')
+                else:
+                    self._switch_tool_runtime(detected)
+                self._physical_tool_detached = False
+                self._tool_detection_reason = ''
+            except Exception as exc:
+                self._tool_change_error = str(exc)
+                self._tool_detection_reason = str(exc)
+                self.get_logger().error(
+                    f'automatic tool change rejected: {exc}')
+            finally:
+                self._tool_change_pending = None
+        finally:
+            self._tool_change_lock.release()
+
     def _configure_tool_actuators(self):
         """Apply profile motion limits only after strict validation and discovery."""
         if self.tool_profile.get('backend') == 'cleaner':
@@ -1876,6 +2010,9 @@ class MoveItDynamixelBridge(Node):
         """Echo ownership requests; this is ROS state only, never a motor write."""
         self._on_control_mode(msg)
         self.control_mode_status_pub.publish(String(data=self.control_mode))
+
+    def _on_arm_fsm_state(self, msg):
+        self._arm_fsm_state = str(msg.data).strip().upper()
 
     def _publish_tool_status_safely(self):
         """Keep a status serialization fault from silently stopping updates."""
@@ -2097,6 +2234,14 @@ class MoveItDynamixelBridge(Node):
             'control_mode': self.control_mode,
             'emergency_stop': self.emergency_stop_active,
             'tool_detached': self.tool_detached,
+            'physical_tool_detached': self._physical_tool_detached,
+            'automatic_detection': {
+                'enabled': bool(self._bus_tool_identity),
+                'present_ids': (sorted(self._bus_tool_identity.last_present_ids)
+                                if self._bus_tool_identity else []),
+                'reason': self._tool_detection_reason,
+                'arm_fsm_state': self._arm_fsm_state,
+            },
             'actuators': [self._tool_samples.get(dxl_id, {
                 'id': dxl_id, 'joint': '', 'position': None,
                 'effort': 0.0 if self.mock_mode else None,

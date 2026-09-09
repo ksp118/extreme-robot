@@ -29,6 +29,49 @@ class ParameterToolIdentityProvider(ToolIdentityProvider):
         return self._tool_type
 
 
+class BusToolIdentityProvider(ToolIdentityProvider):
+    """Identify one exact, non-arm actuator signature from profile IDs."""
+
+    def __init__(self, profiles, probe, excluded_ids=()):
+        excluded = {int(item) for item in excluded_ids}
+        self._probe = probe
+        self._signatures = {}
+        for tool_type, profile in profiles.items():
+            signature = frozenset(
+                int(item) for item in profile.get('actuator_ids', []))
+            if signature and not signature & excluded:
+                self._signatures[tool_type] = signature
+        self.last_present_ids = frozenset()
+        self.last_reason = 'not scanned'
+
+    @property
+    def candidate_ids(self):
+        return frozenset().union(*self._signatures.values()) \
+            if self._signatures else frozenset()
+
+    @property
+    def supported_tool_types(self):
+        return frozenset(self._signatures)
+
+    def detected_tool_type(self):
+        present = set()
+        for actuator_id in sorted(self.candidate_ids):
+            try:
+                if self._probe(actuator_id):
+                    present.add(actuator_id)
+            except Exception:
+                continue
+        self.last_present_ids = frozenset(present)
+        matches = [name for name, signature in self._signatures.items()
+                   if signature == self.last_present_ids]
+        if len(matches) == 1:
+            self.last_reason = ''
+            return matches[0]
+        self.last_reason = ('no supported tool actuator detected' if not present
+                            else f'ambiguous actuator IDs: {sorted(present)}')
+        return None
+
+
 class ToolManager:
     """Resolve profiles and enforce that selection changes occur while safe."""
 
