@@ -1809,13 +1809,69 @@ class MoveItDynamixelBridge(Node):
             else:
                 self.torque_enabled_ids.discard(int(dxl_id))
             return
-        self._write_register(dxl_id, ADDR_TORQUE_ENABLE, 1,
-                             TORQUE_ENABLE if enabled else TORQUE_DISABLE,
-                             'FSM torque')
+        with self._bus_lock:
+            if (enabled and self.tool_type == 'spur_1motor_gripper'
+                    and int(dxl_id) == 5):
+                self._prepare_spur_gripper_enable()
+            self._write_register(dxl_id, ADDR_TORQUE_ENABLE, 1,
+                                 TORQUE_ENABLE if enabled else TORQUE_DISABLE,
+                                 'FSM torque')
         if enabled:
             self.torque_enabled_ids.add(int(dxl_id))
         else:
             self.torque_enabled_ids.discard(int(dxl_id))
+
+    def _prepare_spur_gripper_enable(self):
+        """Safely park and configure ID5 immediately before explicit torque-on."""
+        if self.tool_type != 'spur_1motor_gripper' or self.tool_ids != [5]:
+            raise RuntimeError('spur profile setup is restricted to ID5')
+        required_modes = self.tool_profile.get('required_operating_modes') or {}
+        required_mode = required_modes.get(5, required_modes.get('5'))
+        acceleration = int(self.tool_profile.get('profile_acceleration') or 0)
+        velocity = int(self.tool_profile.get('profile_velocity') or 0)
+        low = int(self.tool_profile['safe_min_tick'])
+        high = int(self.tool_profile['safe_max_tick'])
+        if required_mode is None or acceleration <= 0 or velocity <= 0:
+            raise RuntimeError('spur mode/profile values are not configured')
+
+        hardware_error = self._read_register(
+            5, ADDR_HARDWARE_ERROR_STATUS, 1, 'spur hardware error')
+        if hardware_error != 0:
+            raise RuntimeError(f'ID5 hardware error: {hardware_error}')
+        torque = self._read_register(5, ADDR_TORQUE_ENABLE, 1, 'spur torque')
+        if torque != TORQUE_DISABLE:
+            raise RuntimeError('actual ID5 torque must be OFF before profile setup')
+        mode = self._read_register(5, ADDR_OPERATING_MODE, 1, 'spur mode')
+        if mode != int(required_mode):
+            raise RuntimeError(
+                f'ID5 operating mode {mode} does not match required {required_mode}')
+        current_raw = self._read_register(
+            5, ADDR_PRESENT_POSITION, 4, 'spur present position')
+        current = self._tool_position_tick(5, current_raw)
+        if not low <= current <= high:
+            raise RuntimeError(
+                f'ID5 position {current} outside safe range [{low}, {high}]')
+
+        for address, value, label in (
+                (ADDR_PROFILE_ACCELERATION, acceleration,
+                 'spur profile acceleration'),
+                (ADDR_PROFILE_VELOCITY, velocity, 'spur profile velocity')):
+            self._write_register(5, address, 4, value, label)
+            actual = self._read_register(5, address, 4, f'{label} readback')
+            if actual != value:
+                raise RuntimeError(
+                    f'{label} readback mismatch: expected {value}, got {actual}')
+
+        # Goal Position may contain a value from an earlier power/session.
+        # Park it at the measured position before torque is enabled so the
+        # mechanism cannot jump when the control loop engages.
+        self._write_register(
+            5, ADDR_GOAL_POSITION, 4, current & 0xffffffff,
+            'spur current-position goal')
+        goal = self._read_register(
+            5, ADDR_GOAL_POSITION, 4, 'spur goal readback')
+        if self._tool_position_tick(5, goal) != current:
+            raise RuntimeError('ID5 current-position goal readback mismatch')
 
     def _discover_tool_ids(self):
         """Ping every configured actuator; any missing ID closes the backend."""
