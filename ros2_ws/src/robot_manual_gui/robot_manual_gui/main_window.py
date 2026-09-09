@@ -655,6 +655,10 @@ class ManualMainWindow(QMainWindow):
             return
         command = (('LEFT', 'RIGHT') if self.node.selected_tool == 'cleaner'
                    else ('CLOSE', 'OPEN'))[number - 1]
+        if self.node.selected_tool == 'cleaner':
+            if self.node.command_cleaner_direction(command):
+                self._append_log(f'청소기 즉시 {"좌회전" if command == "LEFT" else "우회전"} 요청')
+            return
         self.node.command_tool_fsm(command)
 
     def _refresh_common_buttons(self):
@@ -668,13 +672,21 @@ class ManualMainWindow(QMainWindow):
         self.clean_start.hide()
         self.clean_stop.hide()
         if cleaner:
-            ready = (self.control_mode == 'MANUAL' and self._tool_motion_ready()
+            direct = bool(
+                getattr(self.node, 'developer_direct_mode', False)
+                and self.node.control_scope == 'END_EFFECTOR_ONLY'
+                and not self.tool_status.get('read_only')
+                and not self.tool_status.get('emergency_stop')
+                and not self.tool_status.get('tool_detached'))
+            ready = ((direct or (self.control_mode == 'MANUAL'
+                                 and self._tool_motion_ready()))
                      and bool(self.profile.get('actuator_ids'))
                      and bool(self.tool_status.get('actuators_discovered'))
                      and not self.pending_tool_change)
             self.close_button.setEnabled(ready)
             self.open_button.setEnabled(ready)
-            self.tool_stop.setEnabled(not self.tool_status.get('read_only'))
+            self.tool_stop.setEnabled(
+                direct or not self.tool_status.get('read_only'))
         # The integrated operator panel exposes exactly two motion buttons.
         # Bench calibration/recovery widgets remain available in bench scope.
         if self.node.control_scope == 'FULL_ROBOT':

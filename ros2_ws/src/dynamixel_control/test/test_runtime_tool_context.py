@@ -119,3 +119,12 @@ def test_developer_cleaner_command_has_its_own_executor_group_and_minimum_gate()
     assert 'direct_bench' in command
     assert 'self.emergency_stop_active or self.tool_detached' in command
     assert 'not self.cleaning_configured or not self.tool_discovered' in command
+
+
+def test_cleaner_direction_buttons_use_the_interrupt_ingress():
+    source = Path(__file__).parents[1] / 'dynamixel_control/moveit_dynamixel_bridge.py'
+    text = source.read_text()
+    subscription = text[text.index("String, '/cleaning/direction'"):
+                        text.index('Bool, "/tool/emergency_stop"')]
+    assert 'callback_group=self._cleaner_direct_group' in subscription
+    assert 'def _on_cleaning_direction' in text

@@ -82,6 +82,8 @@ class ManualGuiNode(Node):
         self.arm_pub = self.create_publisher(
             JointTrajectory, '/arm_controller/joint_trajectory', 10)
         self.cleaner_pub = self.create_publisher(Bool, '/cleaning/enable', 10)
+        self.cleaner_direction_pub = self.create_publisher(
+            String, '/cleaning/direction', 10)
         self.estop_pub = self.create_publisher(Bool, '/tool/emergency_stop', 10)
         self.detach_pub = self.create_publisher(Bool, '/tool/detached', 10)
         self.mode_pub = self.create_publisher(String, '/control/mode', 10)
@@ -369,6 +371,19 @@ class ManualGuiNode(Node):
             self.signals.log.emit('Cleaner command blocked: ownership is not MANUAL')
             return
         self.cleaner_pub.publish(Bool(data=bool(enabled)))
+
+    def command_cleaner_direction(self, command):
+        """Low-latency cleaner direction path, separate from the FSM queue."""
+        if self.read_only or self.selected_tool != 'cleaner':
+            return False
+        command = str(command).strip().upper()
+        if command not in ('LEFT', 'RIGHT', 'STOP'):
+            return False
+        if self.control_mode != 'MANUAL' and not self.developer_direct_mode:
+            self.signals.log.emit('Cleaner direction blocked: ownership is not MANUAL')
+            return False
+        self.cleaner_direction_pub.publish(String(data=command))
+        return True
 
     def emergency_stop(self):
         # Hold the manually commanded arm at the latest measured positions using

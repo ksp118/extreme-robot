@@ -752,6 +752,9 @@ class MoveItDynamixelBridge(Node):
             Bool, "/cleaning/enable", self._on_cleaning_enable, 10,
             callback_group=self._cleaner_direct_group)
         self.create_subscription(
+            String, '/cleaning/direction', self._on_cleaning_direction, 10,
+            callback_group=self._cleaner_direct_group)
+        self.create_subscription(
             Bool, "/tool/emergency_stop", self._on_emergency_stop, 10,
             callback_group=self._command_group)
         self.create_subscription(
@@ -2655,12 +2658,20 @@ class MoveItDynamixelBridge(Node):
         if command == 'STOP':
             self._on_cleaning_enable(Bool(data=False))
             return
-        if command not in ('LEFT', 'RIGHT') or self.control_mode != 'MANUAL':
+        direct_bench = bool(
+            self.developer_direct_mode
+            and self.control_scope == 'END_EFFECTOR_ONLY')
+        if (command not in ('LEFT', 'RIGHT')
+                or (not direct_bench and self.control_mode != 'MANUAL')):
             return
         if not self.cleaning_configured or not self.tool_discovered:
             self.get_logger().warn('Cleaner direction command requires a configured actuator')
             return
         self._on_cleaning_enable(Bool(data=True), 1 if command == 'LEFT' else -1)
+
+    def _on_cleaning_direction(self, msg):
+        """Dedicated immediate LEFT/RIGHT/STOP ingress for the GUI buttons."""
+        self._cleaner_direction_command(str(msg.data).strip().upper())
 
     def _on_cleaning_enable(self, msg, rotation=1):
         if self.tool_type != 'cleaner' or self.read_only:
