@@ -10,6 +10,8 @@ from rclpy.executors import SingleThreadedExecutor
 
 from dynamixel_control.tool_profiles import get_profile, load_profiles
 from robot_manual_gui.main_window import ManualMainWindow
+from robot_manual_gui.qt_lifecycle import (
+    install_context_watch, install_signal_quit, shutdown)
 from robot_manual_gui.ros_interface import GuiSignals, ManualGuiNode
 
 
@@ -27,13 +29,21 @@ def main(args=None):
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
     window = ManualMainWindow(node, signals, profile, node.mock_mode)
-    window.show()
-    result = app.exec_()
-    executor.shutdown()
-    node.destroy_node()
-    if rclpy.ok():
-        rclpy.shutdown()
-    spin_thread.join(timeout=1.0)
+    # Use the available desktop while retaining window-manager controls.  The
+    # dashboard itself is scrollable on displays smaller than its size hint.
+    window.showMaximized()
+    # Installed after rclpy.init so they replace rclpy's own handlers, which
+    # take the context down without ever ending this Qt loop.
+    signal_timer = install_signal_quit(app)
+    context_timer = install_context_watch(app, rclpy.ok)
+    try:
+        result = app.exec_()
+    finally:
+        signal_timer.stop()
+        context_timer.stop()
+        for error in shutdown(executor, [node], spin_thread,
+                              shutdown_ros=rclpy.shutdown, ok=rclpy.ok):
+            print(f'shutdown step failed: {error}', file=sys.stderr)
     return result
 
 

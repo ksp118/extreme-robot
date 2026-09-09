@@ -8,16 +8,33 @@ from PyQt5.QtWidgets import (
     QAbstractSpinBox, QApplication, QComboBox, QDoubleSpinBox, QFormLayout,
     QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
-    QLineEdit, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
+    QLineEdit, QScrollArea, QTableWidget, QTableWidgetItem, QTextEdit,
+    QVBoxLayout, QWidget)
 
 from robot_manual_gui.ros_interface import ARM_JOINTS
 from robot_manual_gui.korean_text import ko
+from robot_manual_gui.qt_lifecycle import restart_parent_launch
 from dynamixel_control.tool_manager import ToolManager
 
 
 TRUE_STYLE = 'color: #0b7a25; font-weight: bold;'
 FALSE_STYLE = 'color: #b00020; font-weight: bold;'
 ESTOP_STYLE = 'background: #b00020; color: white; font-size: 20px; font-weight: bold;'
+
+# `/tool/status` older than this is not evidence of anything current.
+STATUS_FRESH_S = 1.5
+# The bridge answers a `/tool/change` inside one status period; this is the
+# GUI's own deadline for giving up on an answer.  It only releases the request
+# latch — every motion gate is recomputed from live status afterwards.
+TOOL_CHANGE_TIMEOUT_S = 3.0
+# A request published while `/tool/status` is already stale has no listener we
+# can observe.  Report the lost link instead of making the operator wait out
+# the full deadline, but allow one grace window for a late status sample.
+TOOL_CHANGE_DISCONNECT_GRACE_S = 1.0
+# Every request ends in exactly one of these; `PENDING` is the only state that
+# latches the tool panel.
+TOOL_CHANGE_STATES = (
+    'IDLE', 'PENDING', 'DONE', 'REJECTED', 'TIMEOUT', 'DISCONNECTED', 'CANCELED')
 
 
 class ManualMainWindow(QMainWindow):
@@ -33,7 +50,16 @@ class ManualMainWindow(QMainWindow):
         self.profile = profile
         self.mock_mode = mock_mode
         self.tool_status = {}
+        # Injectable so a test can drive the request deadline without sleeping.
+        self._clock = time.monotonic
         self.pending_tool_change = None
+        self.pending_tool_change_started = None
+        self.pending_tool_change_link_ok = False
+        self.tool_change_requested = None
+        self.tool_change_state = 'IDLE'
+        self.tool_change_detail = ''
+        self.tool_change_timeout_s = TOOL_CHANGE_TIMEOUT_S
+        self.tool_change_disconnect_grace_s = TOOL_CHANGE_DISCONNECT_GRACE_S
         self.spur_hold_command = None
         self.spur_hold_timer = QTimer(self)
         self.spur_hold_timer.setInterval(100)
@@ -112,13 +138,14 @@ class ManualMainWindow(QMainWindow):
         self.estop.clicked.connect(self._estop)
         self.detach = QPushButton(ko('TOOL DETACHED'))
         self.detach.clicked.connect(self._detach)
-        self.reset = QPushButton(ko('RESET E-STOP (restart required)'))
-        self.reset.setEnabled(False)
+        self.restart_program = QPushButton(ko('프로그램 재구동'))
+        self.restart_program.setEnabled(False)
+        self.restart_program.clicked.connect(self._restart_program)
         self.estop_state = QLabel(ko('E-STOP: FALSE'))
         self.estop_state.setStyleSheet(TRUE_STYLE)
         safety.addWidget(self.estop, 3)
         safety.addWidget(self.detach)
-        safety.addWidget(self.reset)
+        safety.addWidget(self.restart_program)
         safety.addWidget(self.estop_state)
         outer.addLayout(safety)
 
@@ -143,7 +170,15 @@ class ManualMainWindow(QMainWindow):
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(120)
         outer.addWidget(self.log)
-        self.setCentralWidget(root)
+        # Hardware panels can be taller/wider than a laptop display.  Keep the
+        # whole dashboard reachable instead of clipping its lower controls.
+        self.content_widget = root
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area.setWidget(root)
+        self.setCentralWidget(self.scroll_area)
 
     def _status_group(self):
         box = QGroupBox(ko('Connection / Status'))
@@ -153,6 +188,8 @@ class ManualMainWindow(QMainWindow):
         for key, title in (
                 ('connection', 'Bridge connection'),
                 ('u2d2', 'U2D2 / serial'), ('tool_type', 'Tool type'),
+                ('tool_change', 'Tool change request'),
+                ('tool_block', 'Blocked reason'),
                 ('profile_valid', 'Profile valid'),
                 ('calibration_valid', 'Calibration / endpoints valid'),
                 ('actuators_discovered', 'Actuators discovered'),
@@ -174,6 +211,7 @@ class ManualMainWindow(QMainWindow):
             title_label = QLabel(ko(title))
             self.status_titles[key] = title_label
             form.addRow(title_label, label)
+        self._refresh_tool_change_labels()
         self._update_status_panel({})
         return box
 
@@ -185,7 +223,10 @@ class ManualMainWindow(QMainWindow):
                        else tool == 'spur_1motor_gripper' if key.startswith('spur_')
                        else True)
             if tool == 'spur_1motor_gripper':
-                visible = key.startswith('spur_') or key == 'fsm'
+                # The request/blocked rows explain a locked panel, so they stay
+                # readable in every tool context.
+                visible = (key.startswith('spur_')
+                           or key in ('fsm', 'tool_change', 'tool_block'))
             label.setVisible(visible)
             self.status_titles[key].setVisible(visible)
         if hasattr(self, 'diag'):
@@ -256,6 +297,12 @@ class ManualMainWindow(QMainWindow):
         self.tool_combo.setCurrentIndex(self.tool_combo.findData(self.node.selected_tool))
         request = QPushButton(ko('REQUEST TOOL CHANGE'))
         request.clicked.connect(self._request_tool_change)
+        # Deliberately outside `tool_control_box`: this is the operator's way
+        # out of a pending request, so it must stay clickable while the tool
+        # panel is latched.
+        self.cancel_tool_change = QPushButton(ko('CANCEL TOOL CHANGE'))
+        self.cancel_tool_change.clicked.connect(self._cancel_tool_change)
+        self.cancel_tool_change.setEnabled(False)
         self.mode_combo = QComboBox()
         for mode in ('FSM', 'MANUAL'):
             self.mode_combo.addItem(ko(mode), mode)
@@ -263,6 +310,7 @@ class ManualMainWindow(QMainWindow):
         mode_request.clicked.connect(self._request_mode)
         form.addRow(ko('Selected tool'), self.tool_combo)
         form.addRow(ko(''), request)
+        form.addRow(ko(''), self.cancel_tool_change)
         form.addRow(ko('Ownership'), self.mode_combo)
         form.addRow(ko(''), mode_request)
         return box
@@ -281,13 +329,117 @@ class ManualMainWindow(QMainWindow):
                 'captured_endpoints_label', 'validate_calibration',
                 'save_calibration', 'spur_mapping', 'spur_minus_5',
                 'spur_zero', 'spur_plus_5', 'motor_minus_half', 'motor_plus_half',
-                'motor_minus_one', 'motor_plus_one'):
+                'motor_minus_one', 'motor_plus_one', 'developer_direct_box',
+                'developer_enable', 'developer_disable', 'developer_minus',
+                'developer_plus', 'developer_minus_five',
+                'developer_plus_five', 'developer_hold',
+                'spur_calibration_box', 'spur_calibration_state',
+                'spur_calibration_start', 'spur_calibration_enable',
+                'spur_calibration_disable', 'spur_calibration_minus',
+                'spur_calibration_plus', 'spur_calibration_minus_five',
+                'spur_calibration_plus_five', 'spur_calibration_capture_open',
+                'spur_calibration_capture_close',
+                'spur_calibration_validate', 'spur_calibration_save'):
             setattr(self, name, None)
         box = QGroupBox(ko('End Effector'))
         layout = QVBoxLayout(box)
         self.profile_text = QLabel(ko(self._profile_summary()))
         self.profile_text.setWordWrap(True)
         layout.addWidget(self.profile_text)
+        if (getattr(self.node, 'developer_direct_mode', False)
+                and self.node.selected_tool == 'spur_1motor_gripper'
+                and self.node.control_scope == 'END_EFFECTOR_ONLY'):
+            self.developer_direct_box = QGroupBox(ko('개발자 직접 구동 · ID 5 전용'))
+            self.developer_direct_box.setStyleSheet(
+                'QGroupBox { font-weight: bold; color: #7a4100; }')
+            developer = QGridLayout(self.developer_direct_box)
+            notice = QLabel(ko(
+                '수동 권한·FSM·보정 절차 없이 즉시 시험합니다. '
+                '비상 정지, 오류, 오프라인, 안전 범위는 계속 차단됩니다.'))
+            notice.setWordWrap(True)
+            developer.addWidget(notice, 0, 0, 1, 3)
+            self.developer_enable = QPushButton(ko('토크 켜기'))
+            self.developer_disable = QPushButton(ko('토크 끄기'))
+            self.developer_hold = QPushButton(ko('현재 위치 정지'))
+            self.developer_minus = QPushButton(ko('−0.5°'))
+            self.developer_plus = QPushButton(ko('+0.5°'))
+            self.developer_minus_five = QPushButton(ko('−5° 크게 이동'))
+            self.developer_plus_five = QPushButton(ko('+5° 크게 이동'))
+            self.developer_enable.clicked.connect(
+                lambda: self._developer_spur_command('manual_enable'))
+            self.developer_disable.clicked.connect(
+                lambda: self._developer_spur_command('manual_disable'))
+            self.developer_hold.clicked.connect(
+                lambda: self._developer_spur_command('manual_hold'))
+            self.developer_minus.clicked.connect(
+                lambda: self._developer_spur_command('manual_step', -0.5))
+            self.developer_plus.clicked.connect(
+                lambda: self._developer_spur_command('manual_step', 0.5))
+            self.developer_minus_five.clicked.connect(
+                lambda: self._developer_spur_command('manual_step', -5.0))
+            self.developer_plus_five.clicked.connect(
+                lambda: self._developer_spur_command('manual_step', 5.0))
+            developer.addWidget(self.developer_enable, 1, 0)
+            developer.addWidget(self.developer_disable, 1, 1)
+            developer.addWidget(self.developer_hold, 1, 2)
+            developer.addWidget(self.developer_minus, 2, 0, 1, 2)
+            developer.addWidget(self.developer_plus, 2, 2)
+            developer.addWidget(self.developer_minus_five, 3, 0, 1, 2)
+            developer.addWidget(self.developer_plus_five, 3, 2)
+            layout.addWidget(self.developer_direct_box)
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            # Reuse the existing bridge-owned CalibrationSession rather than
+            # creating a second calibration protocol in the GUI.  This gives
+            # the operator one compact, ordered endpoint workflow.
+            self.spur_calibration_box = QGroupBox(ko('그리퍼 끝점 캘리브레이션 · ID 5'))
+            calibration = QGridLayout(self.spur_calibration_box)
+            guide = QLabel(ko(
+                '1. 시작  2. 토크 켜기  3. ±5°로 근접 후 ±0.5°로 미세 조정  '
+                '4. 열림/닫힘 현재 위치 기록  5. 검증  6. 저장'))
+            guide.setWordWrap(True)
+            calibration.addWidget(guide, 0, 0, 1, 4)
+            self.spur_calibration_state = QLabel(ko('시작 전'))
+            calibration.addWidget(self.spur_calibration_state, 1, 0, 1, 4)
+            self.spur_calibration_start = QPushButton(ko('캘리브레이션 시작'))
+            self.spur_calibration_enable = QPushButton(ko('토크 켜기'))
+            self.spur_calibration_disable = QPushButton(ko('토크 끄기'))
+            self.spur_calibration_start.clicked.connect(self._start_calibration)
+            self.spur_calibration_enable.clicked.connect(self._enable_spur_motor)
+            self.spur_calibration_disable.clicked.connect(self._disable_spur_motor)
+            calibration.addWidget(self.spur_calibration_start, 2, 0, 1, 2)
+            calibration.addWidget(self.spur_calibration_enable, 2, 2)
+            calibration.addWidget(self.spur_calibration_disable, 2, 3)
+            self.spur_calibration_minus = QPushButton(ko('−0.5° 이동'))
+            self.spur_calibration_plus = QPushButton(ko('+0.5° 이동'))
+            self.spur_calibration_minus.clicked.connect(
+                lambda: self._calibration_jog(-0.5))
+            self.spur_calibration_plus.clicked.connect(
+                lambda: self._calibration_jog(0.5))
+            calibration.addWidget(self.spur_calibration_minus, 3, 0, 1, 2)
+            calibration.addWidget(self.spur_calibration_plus, 3, 2, 1, 2)
+            self.spur_calibration_minus_five = QPushButton(ko('−5° 크게 이동'))
+            self.spur_calibration_plus_five = QPushButton(ko('+5° 크게 이동'))
+            self.spur_calibration_minus_five.clicked.connect(
+                lambda: self._calibration_jog(-5.0))
+            self.spur_calibration_plus_five.clicked.connect(
+                lambda: self._calibration_jog(5.0))
+            calibration.addWidget(self.spur_calibration_minus_five, 4, 0, 1, 2)
+            calibration.addWidget(self.spur_calibration_plus_five, 4, 2, 1, 2)
+            self.spur_calibration_capture_open = QPushButton(ko('현재 위치를 열림으로 기록'))
+            self.spur_calibration_capture_close = QPushButton(ko('현재 위치를 닫힘으로 기록'))
+            self.spur_calibration_capture_open.clicked.connect(
+                lambda: self._capture_spur_endpoint('open'))
+            self.spur_calibration_capture_close.clicked.connect(
+                lambda: self._capture_spur_endpoint('close'))
+            calibration.addWidget(self.spur_calibration_capture_open, 5, 0, 1, 2)
+            calibration.addWidget(self.spur_calibration_capture_close, 5, 2, 1, 2)
+            self.spur_calibration_validate = QPushButton(ko('기록값 검증'))
+            self.spur_calibration_save = QPushButton(ko('프로파일 저장'))
+            self.spur_calibration_validate.clicked.connect(self._validate_spur_calibration)
+            self.spur_calibration_save.clicked.connect(self._save_spur_calibration)
+            calibration.addWidget(self.spur_calibration_validate, 6, 0, 1, 2)
+            calibration.addWidget(self.spur_calibration_save, 6, 2, 1, 2)
+            layout.addWidget(self.spur_calibration_box)
         if not hasattr(self, 'common_enable'):
             self.open_button = QPushButton(ko('OPEN'))
             self.close_button = QPushButton(ko('CLOSE'))
@@ -296,9 +448,19 @@ class ManualMainWindow(QMainWindow):
             self.hold_close_button = QPushButton(ko('HOLD TO CLOSE'))
             self.common_enable = QPushButton('활성화')
             self.common_disable = QPushButton('비활성화')
-            self.open_button.clicked.connect(lambda: self._common_action(2))
-            self.close_button.clicked.connect(lambda: self._common_action(1))
-            self.tool_stop.clicked.connect(self._stop_tool)
+            # Cleaner direction must leave the GUI on mouse/key press, not on
+            # Qt's clicked signal (which fires only after release).  The same
+            # shared buttons retain release-click behaviour for grippers.
+            self.open_button.pressed.connect(
+                lambda: self._common_pressed(2))
+            self.close_button.pressed.connect(
+                lambda: self._common_pressed(1))
+            self.open_button.clicked.connect(
+                lambda: self._common_clicked(2))
+            self.close_button.clicked.connect(
+                lambda: self._common_clicked(1))
+            self.tool_stop.pressed.connect(self._tool_stop_pressed)
+            self.tool_stop.clicked.connect(self._tool_stop_clicked)
             self.common_enable.clicked.connect(lambda: self._common_torque(True))
             self.common_disable.clicked.connect(lambda: self._common_torque(False))
             self.hold_open_button.pressed.connect(lambda: self._common_hold('OPEN'))
@@ -509,6 +671,29 @@ class ManualMainWindow(QMainWindow):
         elif self.node.selected_tool == 'spur_1motor_gripper':
             self.node.command_calibration('manual_enable' if enabled else 'manual_disable')
 
+    def _developer_spur_ready(self):
+        sample = self._gripper_samples().get(5, {})
+        return bool(
+            getattr(self.node, 'developer_direct_mode', False)
+            and self.node.selected_tool == 'spur_1motor_gripper'
+            and self.node.control_scope == 'END_EFFECTOR_ONLY'
+            and self.tool_status.get('tool_type') == 'spur_1motor_gripper'
+            and self._status_fresh()
+            and not self.tool_status.get('read_only')
+            and not getattr(self.node, 'read_only', False)
+            and not self.tool_status.get('emergency_stop')
+            and not self.tool_status.get('tool_detached')
+            and sample.get('online') and sample.get('hardware_error') == 0
+            and isinstance(sample.get('position'), int))
+
+    def _developer_spur_command(self, command, delta_deg=0.0):
+        if not self._developer_spur_ready():
+            self._append_log('개발자 직접 구동 차단: ID5 실시간 안전 상태를 확인하세요')
+            return
+        if self.node.command_calibration(command, delta_deg=float(delta_deg)):
+            detail = f' {delta_deg:+.1f}°' if command == 'manual_step' else ''
+            self._append_log(f'개발자 직접 구동 요청: {command}{detail}')
+
     def _common_hold(self, direction):
         if self.node.selected_tool == 'dual_motor_gripper':
             self._start_dual_hold_jog(direction)
@@ -529,18 +714,40 @@ class ManualMainWindow(QMainWindow):
                     and self.pending_tool_change is None
                     and self.control_mode == 'MANUAL'
                     and self.node.control_scope in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')
-                    and time.monotonic() - self.last_status_time < 1.5
+                    and self._status_fresh()
                     and not status.get('read_only') and not getattr(self.node, 'read_only', False)
                     and not status.get('emergency_stop') and not status.get('tool_detached')
                     and sample.get('online') and sample.get('hardware_error') == 0
-                    and self.fsm_state in ('READY', 'OPEN', 'CLOSED'))
+                    and self.fsm_state in ('STOPPED', 'READY', 'OPEN', 'CLOSED'))
 
     def _common_action(self, number):
         if self.pending_tool_change:
             return
         command = (('LEFT', 'RIGHT') if self.node.selected_tool == 'cleaner'
                    else ('CLOSE', 'OPEN'))[number - 1]
+        if self.node.selected_tool == 'cleaner':
+            if self.node.command_cleaner_direction(command):
+                self._append_log(f'청소기 즉시 {"좌회전" if command == "LEFT" else "우회전"} 요청')
+            return
         self.node.command_tool_fsm(command)
+
+    def _common_pressed(self, number):
+        """Send cleaner direction at physical button/key depression."""
+        if self.node.selected_tool == 'cleaner':
+            self._common_action(number)
+
+    def _common_clicked(self, number):
+        """Keep the gripper buttons' historical release-click behaviour."""
+        if self.node.selected_tool != 'cleaner':
+            self._common_action(number)
+
+    def _tool_stop_pressed(self):
+        if self.node.selected_tool == 'cleaner':
+            self._stop_tool()
+
+    def _tool_stop_clicked(self):
+        if self.node.selected_tool != 'cleaner':
+            self._stop_tool()
 
     def _refresh_common_buttons(self):
         self._refresh_legacy_common_buttons()
@@ -553,13 +760,21 @@ class ManualMainWindow(QMainWindow):
         self.clean_start.hide()
         self.clean_stop.hide()
         if cleaner:
-            ready = (self.control_mode == 'MANUAL' and self._tool_motion_ready()
+            direct = bool(
+                getattr(self.node, 'developer_direct_mode', False)
+                and self.node.control_scope == 'END_EFFECTOR_ONLY'
+                and not self.tool_status.get('read_only')
+                and not self.tool_status.get('emergency_stop')
+                and not self.tool_status.get('tool_detached'))
+            ready = ((direct or (self.control_mode == 'MANUAL'
+                                 and self._tool_motion_ready()))
                      and bool(self.profile.get('actuator_ids'))
                      and bool(self.tool_status.get('actuators_discovered'))
                      and not self.pending_tool_change)
             self.close_button.setEnabled(ready)
             self.open_button.setEnabled(ready)
-            self.tool_stop.setEnabled(not self.tool_status.get('read_only'))
+            self.tool_stop.setEnabled(
+                direct or not self.tool_status.get('read_only'))
         # The integrated operator panel exposes exactly two motion buttons.
         # Bench calibration/recovery widgets remain available in bench scope.
         if self.node.control_scope == 'FULL_ROBOT':
@@ -580,7 +795,8 @@ class ManualMainWindow(QMainWindow):
         torque_on = sample.get('torque_state') == 'ON'
         # Torque-off readiness must never depend on motion_allowed or calibration-session state.
         self.common_enable.setEnabled(ready and not torque_on)
-        motion = ready and torque_on
+        motion = (ready and torque_on
+                  and self.fsm_state in ('READY', 'OPEN', 'CLOSED'))
         for widget in (self.open_button, self.close_button,
                        self.hold_open_button, self.hold_close_button):
             widget.setEnabled(motion)
@@ -599,7 +815,7 @@ class ManualMainWindow(QMainWindow):
             'no_pending_change': self.pending_tool_change is None,
             'manual': self.control_mode == 'MANUAL',
             'scope': self.node.control_scope == 'END_EFFECTOR_ONLY',
-            'fresh': time.monotonic() - self.last_status_time < 1.5,
+            'fresh': self._status_fresh(),
             'bridge_writable': not bool(status.get('read_only')),
             'gui_writable': not getattr(self.node, 'read_only', False),
             'no_estop': not bool(status.get('emergency_stop')),
@@ -664,16 +880,151 @@ class ManualMainWindow(QMainWindow):
         label.setText(ko('TRUE' if value else 'FALSE'))
         label.setStyleSheet(TRUE_STYLE if value else FALSE_STYLE)
 
+    def _status_fresh(self):
+        """True only while `/tool/status` is recent enough to act on."""
+        return self._clock() - self.last_status_time < STATUS_FRESH_S
+
     def _refresh_connection(self):
-        connected = time.monotonic() - self.last_status_time < 1.5
+        connected = self._status_fresh()
         self._set_bool(self.status_labels['connection'], connected)
         if not connected:
             self._set_bool(self.status_labels['motion_allowed'], False)
+        self._expire_tool_change(connected)
+        self._refresh_buttons()
+
+    def _expire_tool_change(self, connected):
+        """Release a request the bridge never answered.
+
+        This clears the GUI-side latch only.  Nothing here grants motion: the
+        buttons are recomputed from live connection/ready/`motion_allowed`
+        state right after, exactly as they are while no request is pending.
+        """
+        if self.pending_tool_change is None:
+            return
+        started = self.pending_tool_change_started
+        if started is None:
+            return
+        elapsed = self._clock() - started
+        # A live bridge stops publishing status while it performs the switch
+        # (both run on its single executor), so silence right after a healthy
+        # request is not proof of a lost link — only the full deadline is.
+        # Silence on a link that was already dead when the operator clicked is
+        # reported at once instead of making them wait it out.
+        if (not connected and not self.pending_tool_change_link_ok
+                and elapsed >= self.tool_change_disconnect_grace_s):
+            self._finish_tool_change(
+                'DISCONNECTED',
+                f'{elapsed:.1f}초 동안 제어 노드 상태를 받지 못했습니다')
+        elif elapsed >= self.tool_change_timeout_s:
+            self._finish_tool_change(
+                'TIMEOUT', f'{self.tool_change_timeout_s:.1f}초 안에 응답이 없습니다')
+
+    def _finish_tool_change(self, state, detail=''):
+        """Single exit for every request outcome (success, error, give-up)."""
+        if state not in TOOL_CHANGE_STATES:
+            raise ValueError(f'unknown tool change state: {state}')
+        requested = self.pending_tool_change
+        self.pending_tool_change = None
+        self.pending_tool_change_started = None
+        self.tool_change_state = state
+        self.tool_change_detail = detail
+        if requested is not None and state != 'DONE':
+            # Never leave the combo advertising a tool the bridge is not on.
+            active = self.tool_status.get('tool_type', self.node.selected_tool)
+            index = self.tool_combo.findData(active)
+            if index >= 0:
+                self.tool_combo.setCurrentIndex(index)
+        if requested is not None:
+            self._append_log(ko(self._tool_change_message()))
+        # Buttons are deliberately left to the caller: on the success path the
+        # tool panel is rebuilt right after this, and refreshing the old panel
+        # for the new tool touches widgets that do not exist yet.
+
+    def _tool_change_message(self):
+        tool = ko(str(self.tool_change_requested))
+        detail = self.tool_change_detail
+        if self.tool_change_state == 'PENDING':
+            return f'도구 변경 요청: {tool} (응답 대기 중)'
+        if self.tool_change_state == 'DONE':
+            return f'도구 변경 완료: {tool}'
+        if self.tool_change_state == 'REJECTED':
+            return f'도구 변경 거부: {tool} — {detail}'
+        if self.tool_change_state == 'TIMEOUT':
+            return f'도구 변경 응답 없음: {tool} — {detail}. 요청을 해제합니다'
+        if self.tool_change_state == 'DISCONNECTED':
+            return (f'도구 변경 중단: {tool} — {detail}. 제어 노드 연결을 확인하세요')
+        if self.tool_change_state == 'CANCELED':
+            return (f'도구 변경 요청 취소: {tool} — 화면 대기만 취소했고 '
+                    '제어 노드에 이미 전달된 요청은 되돌리지 않습니다')
+        return '도구 변경 요청 없음'
+
+    def _refresh_tool_change_labels(self):
+        """Keep requested/active/blocked visible; display only, no commands."""
+        text = self._tool_change_message()
+        if self.pending_tool_change is not None:
+            elapsed = self._clock() - (self.pending_tool_change_started or self._clock())
+            text = f'{text} {elapsed:.1f}초'
+        label = self.status_labels.get('tool_change')
+        if label is not None:
+            label.setText(ko(text))
+            label.setStyleSheet(
+                FALSE_STYLE if self.tool_change_state in (
+                    'REJECTED', 'TIMEOUT', 'DISCONNECTED') else '')
+        blocked = self.status_labels.get('tool_block')
+        if blocked is not None:
+            reason = self._tool_block_reason()
+            blocked.setText(ko(reason or '없음'))
+            blocked.setStyleSheet(FALSE_STYLE if reason else TRUE_STYLE)
+        cancel = getattr(self, 'cancel_tool_change', None)
+        if cancel is not None:
+            cancel.setEnabled(self.pending_tool_change is not None)
+
+    def _tool_block_reason(self):
+        """Why tool motion is unavailable right now, in the operator's terms.
+
+        Written from GUI-visible state only so an untranslated bridge string is
+        never rendered into this Korean panel.
+        """
+        if not self._status_fresh():
+            return '제어 노드 상태 수신 끊김'
+        if self.pending_tool_change is not None:
+            return '도구 변경 요청 응답 대기 중'
+        status = self.tool_status
+        if status.get('emergency_stop'):
+            return '비상 정지 래치'
+        if status.get('tool_detached'):
+            return '도구 분리 래치'
+        if status.get('read_only') or getattr(self.node, 'read_only', False):
+            return '읽기 전용 모드'
+        if not status.get('profile_valid'):
+            return '도구 설정이 유효하지 않음'
+        if not status.get('actuators_discovered'):
+            detected = (status.get('automatic_detection') or {}).get(
+                'present_ids') or []
+            expected = (status.get('tool_profile') or {}).get(
+                'actuator_ids') or []
+            if detected and expected:
+                return ('선택 도구와 연결 모터 번호가 다름 '
+                        f'(감지: {", ".join(map(str, detected))}, '
+                        f'기대: {", ".join(map(str, expected))})')
+            return '도구 모터 미감지'
+        if not status.get('calibrated'):
+            return '보정 필요'
+        if self.control_mode != 'MANUAL':
+            return '수동 제어 권한 없음'
+        if not status.get('motion_allowed'):
+            return '토크 미인가 또는 도구 준비 안 됨'
+        return ''
+
+    def _cancel_tool_change(self):
+        if self.pending_tool_change is None:
+            return
+        self._finish_tool_change('CANCELED')
         self._refresh_buttons()
 
     def _update_tool_status(self, status):
         self.tool_status = status
-        self.last_status_time = time.monotonic()
+        self.last_status_time = self._clock()
         previous_tool = self.node.selected_tool
         reported_tool = status.get('tool_type')
         runtime_profile = status.get('tool_profile')
@@ -683,12 +1034,9 @@ class ManualMainWindow(QMainWindow):
         if self.pending_tool_change:
             if reported_tool == self.pending_tool_change:
                 self.node.selected_tool = reported_tool
-                self.pending_tool_change = None
-                self._append_log(ko(f'도구 런타임 전환 완료: {reported_tool}'))
+                self._finish_tool_change('DONE')
             elif change.get('error'):
-                self.pending_tool_change = None
-                self.tool_combo.setCurrentIndex(self.tool_combo.findData(reported_tool))
-                self._append_log(ko(f'도구 런타임 전환 거부: {change["error"]}'))
+                self._finish_tool_change('REJECTED', str(change['error']))
         elif (reported_tool in ('spur_1motor_gripper', 'dual_motor_gripper', 'cleaner')
               and reported_tool != self.node.selected_tool):
             # The bridge's active tool is separate from the user's pending
@@ -742,6 +1090,7 @@ class ManualMainWindow(QMainWindow):
         estop = bool(status.get('emergency_stop'))
         self.estop_state.setText(ko(f'E-STOP: {str(estop).upper()}'))
         self.estop_state.setStyleSheet(FALSE_STYLE if estop else TRUE_STYLE)
+        self.restart_program.setEnabled(estop)
         self._rebuild_diagnostics(status.get('actuators', []))
         self._update_gripper_feedback()
         self._refresh_buttons()
@@ -787,6 +1136,7 @@ class ManualMainWindow(QMainWindow):
         self._refresh_buttons()
 
     def _refresh_buttons(self):
+        self._refresh_tool_change_labels()
         self.tool_control_box.setEnabled(self.pending_tool_change is None)
         manual = self.control_mode == 'MANUAL'
         end_effector_only = self.node.control_scope == 'END_EFFECTOR_ONLY'
@@ -941,9 +1291,18 @@ class ManualMainWindow(QMainWindow):
         self.gripper_jog_step.setEnabled(not self.gripper_busy)
         cleaner = self.node.selected_tool == 'cleaner'
         configured = bool(self.tool_status.get('actuators_discovered'))
-        self.clean_start.setEnabled(manual and cleaner and profile_ok
-                                    and motion and configured)
-        self.clean_stop.setEnabled(manual and cleaner and profile_ok and motion)
+        cleaner_direct = bool(
+            cleaner and getattr(self.node, 'developer_direct_mode', False)
+            and self.node.control_scope == 'END_EFFECTOR_ONLY'
+            and not bool(self.tool_status.get('read_only'))
+            and not bool(self.tool_status.get('emergency_stop'))
+            and not bool(self.tool_status.get('tool_detached'))
+            and configured)
+        self.clean_start.setEnabled(
+            cleaner_direct or (manual and cleaner and profile_ok
+                               and motion and configured))
+        self.clean_stop.setEnabled(
+            cleaner_direct or (manual and cleaner and profile_ok and motion))
         for widget in (self.spur_minus_5, self.spur_zero, self.spur_plus_5):
             if widget is not None:
                 widget.setEnabled(False)
@@ -983,10 +1342,66 @@ class ManualMainWindow(QMainWindow):
         self.start_cal.setEnabled(
             spur and manual and bool(self.tool_status.get('calibration_jog_enabled'))
             and not calibration.get('active', False))
+        if self.spur_calibration_state is not None:
+            active = bool(calibration.get('active'))
+            enabled = bool(calibration.get('enabled'))
+            captures = calibration.get('captures', {})
+            both_captured = (set(captures) == {'open', 'close'}
+                             and captures['open'] != captures['close'])
+            if not active:
+                state = '시작 전'
+            elif not enabled:
+                state = '토크 켜기 필요'
+            elif calibration.get('validated'):
+                state = '검증 완료 · 저장 가능'
+            elif both_captured:
+                state = '열림/닫힘 기록 완료 · 검증 필요'
+            else:
+                state = '±0.5° 이동 후 열림/닫힘 위치를 각각 기록하세요'
+            self.spur_calibration_state.setText(ko(state))
+            ready = (spur and manual and self._status_fresh()
+                     and not bool(self.tool_status.get('read_only'))
+                     and not bool(self.tool_status.get('emergency_stop'))
+                     and not bool(self.tool_status.get('tool_detached')))
+            healthy = (self._gripper_samples().get(5, {}).get('online')
+                       and self._gripper_samples().get(5, {}).get(
+                           'hardware_error') == 0)
+            self.spur_calibration_start.setEnabled(ready and healthy and not active)
+            self.spur_calibration_enable.setEnabled(
+                ready and active and healthy and not enabled)
+            self.spur_calibration_disable.setEnabled(active and enabled)
+            for button in (self.spur_calibration_minus,
+                           self.spur_calibration_plus,
+                           self.spur_calibration_minus_five,
+                           self.spur_calibration_plus_five,
+                           self.spur_calibration_capture_open,
+                           self.spur_calibration_capture_close):
+                button.setEnabled(ready and active and enabled and healthy)
+            self.spur_calibration_validate.setEnabled(
+                ready and active and both_captured)
+            self.spur_calibration_save.setEnabled(
+                ready and active and bool(calibration.get('validated')))
         self._refresh_common_buttons()
+        self._refresh_developer_direct_buttons()
+
+    def _refresh_developer_direct_buttons(self):
+        """Keep the optional bench panel independent of FSM/manual ownership."""
+        if not getattr(self, 'developer_direct_box', None):
+            return
+        sample = self._gripper_samples().get(5, {})
+        ready = self._developer_spur_ready()
+        torque_on = sample.get('torque_state') == 'ON'
+        self.developer_enable.setEnabled(ready and not torque_on)
+        self.developer_disable.setEnabled(ready and torque_on)
+        self.developer_hold.setEnabled(ready and torque_on)
+        self.developer_minus.setEnabled(ready and torque_on)
+        self.developer_plus.setEnabled(ready and torque_on)
+        self.developer_minus_five.setEnabled(ready and torque_on)
+        self.developer_plus_five.setEnabled(ready and torque_on)
 
     def _spur_manual_ready(self):
         return (self._spur_enable_ready()
+                and self.fsm_state in ('READY', 'OPEN', 'CLOSED')
                 and self._gripper_samples().get(5, {}).get('torque_state') == 'ON')
 
     def _common_motion_ready(self):
@@ -997,7 +1412,7 @@ class ManualMainWindow(QMainWindow):
                     and self.pending_tool_change is None
                     and self.control_mode == 'MANUAL'
                     and self.node.control_scope == 'END_EFFECTOR_ONLY'
-                    and time.monotonic() - self.last_status_time < 1.5
+                    and self._status_fresh()
                     and status.get('tool_type') == self.node.selected_tool
                     and status.get('profile_valid') and status.get('calibrated')
                     and not status.get('read_only') and not getattr(self.node, 'read_only', False)
@@ -1029,7 +1444,7 @@ class ManualMainWindow(QMainWindow):
             self.node.command_calibration('manual_hold')
 
     def _tool_motion_ready(self):
-        fresh = time.monotonic() - self.last_status_time < 1.5
+        fresh = self._status_fresh()
         scope_ok = self.tool_status.get('control_scope') == self.node.control_scope
         tool_type_ok = self.tool_status.get('tool_type') == self.node.selected_tool
         expected_ids = set(self.profile.get('actuator_ids', []))
@@ -1053,7 +1468,7 @@ class ManualMainWindow(QMainWindow):
 
     def _tool_enable_ready(self):
         """Readiness before torque is enabled; used only by ENABLE ID5."""
-        fresh = time.monotonic() - self.last_status_time < 1.5
+        fresh = self._status_fresh()
         return (fresh and bool(self.tool_status.get('bridge_connected'))
                 and bool(self.tool_status.get('online'))
                 and self.tool_status.get('position') is not None
@@ -1285,6 +1700,11 @@ class ManualMainWindow(QMainWindow):
         if self._spur_manual_ready() and self.node.command_calibration('manual_step', delta_deg=float(degrees)):
             self._append_log(f'ID5 CalibrationSession jog {degrees:+.1f}° requested')
 
+    def _calibration_jog(self, degrees):
+        """Compact panel adapter for the existing ID5 CalibrationSession."""
+        if self.node.command_calibration('jog_motor_degrees', delta_deg=float(degrees)):
+            self._append_log(f'캘리브레이션 ID5 이동 요청: {degrees:+.1f}°')
+
     def _capture_spur_endpoint(self, label):
         sample = self._gripper_samples().get(5, {})
         current = sample.get('position')
@@ -1506,6 +1926,9 @@ class ManualMainWindow(QMainWindow):
         self._release_spur_hold()
         if self.dual_key_jog_timer.isActive():
             self._stop_dual_key_jog()
+        # A repeating timer keeps the window alive for the event loop; stop it
+        # so shutdown does not depend on Qt garbage-collection order.
+        self.watchdog.stop()
         super().closeEvent(event)
 
     def _log_key_trace(self, message):
@@ -1530,6 +1953,8 @@ class ManualMainWindow(QMainWindow):
                 and not (self.node.selected_tool == 'spur_1motor_gripper'
                          and self.fsm_state in ('CALIBRATION_REQUIRED', 'STOPPED', 'READY'))
                 and not (self.node.selected_tool == 'dual_motor_gripper'
+                         and self.node.control_scope == 'END_EFFECTOR_ONLY')
+                and not (self.node.selected_tool == 'cleaner'
                          and self.node.control_scope == 'END_EFFECTOR_ONLY')):
             QMessageBox.warning(
                 self, ko('Ownership denied'),
@@ -1551,17 +1976,43 @@ class ManualMainWindow(QMainWindow):
         if self.dual_key_jog_timer.isActive():
             self._stop_dual_key_jog()
         self.pending_tool_change = requested
+        self.tool_change_requested = requested
+        self.pending_tool_change_started = self._clock()
+        self.pending_tool_change_link_ok = self._status_fresh()
+        self.tool_change_state = 'PENDING'
+        self.tool_change_detail = ''
         if not self.node.request_tool_change(requested):
-            self.pending_tool_change = None
-            self.tool_combo.setCurrentIndex(self.tool_combo.findData(current))
+            self._finish_tool_change(
+                'REJECTED', '요청을 발행하지 못했습니다 (GUI 안전 게이트)')
+            self._refresh_buttons()
             return
         self._refresh_buttons()
-        self._append_log(ko(f'도구 런타임 전환 요청: {requested}'))
+        self._append_log(ko(self._tool_change_message()))
 
     def _estop(self):
         self.node.emergency_stop()
         self.estop_state.setText(ko('E-STOP: REQUESTED'))
         self.estop_state.setStyleSheet(FALSE_STYLE)
+        self.restart_program.setEnabled(False)
+
+    def _restart_program(self):
+        """Restart the whole launch after the bridge has latched an E-stop."""
+        if not self.tool_status.get('emergency_stop'):
+            return
+        answer = QMessageBox.question(
+            self, ko('프로그램 재구동'),
+            ko('비상 정지 상태입니다. 현재 프로그램을 종료하고 다시 시작할까요?'))
+        if answer != QMessageBox.Yes:
+            return
+        self.restart_program.setEnabled(False)
+        try:
+            restart_parent_launch()
+        except Exception as exc:
+            self.restart_program.setEnabled(True)
+            self._append_log(f'프로그램 재구동 실패: {exc}')
+            return
+        self._append_log('비상 정지 프로그램을 재구동합니다')
+        QApplication.instance().quit()
 
     def _detach(self):
         answer = QMessageBox.question(
@@ -1584,7 +2035,7 @@ class ManualMainWindow(QMainWindow):
         process.start()
 
     def _read_only_diagnostic(self):
-        if time.monotonic() - self.last_status_time < 1.5:
+        if self._status_fresh():
             self._append_log(
                 'Bridge already owns the serial bus; using /tool/status read-only '
                 f'diagnostics: {self.tool_status}')

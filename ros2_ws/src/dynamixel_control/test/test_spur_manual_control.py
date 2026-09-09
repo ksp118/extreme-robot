@@ -13,6 +13,7 @@ def make_control(open_tick=100, close_tick=200):
     b.read_torque = lambda _: b.torque
     b.read_hardware_error = lambda _: b.error
     b.goal_position = lambda _, tick: setattr(b, 'position', tick)
+    b.set_torque = lambda _, enabled: setattr(b, 'torque', int(enabled))
     return b, SpurManualControl(b)
 
 
@@ -43,3 +44,31 @@ def test_gate_blocks_without_writes(field, value):
     with pytest.raises(RuntimeError):
         c.command('manual_open')
     assert b.position == 150
+
+
+def test_developer_direct_mode_bypasses_fsm_ownership_but_not_hardware_gates():
+    b, c = make_control()
+    b.developer_direct_mode = True
+    b.control_mode = 'FSM'
+    b.tool_fsm.state.name = 'STOPPED'
+    b.tool_profile.update(safe_min_tick=100, safe_max_tick=200, calibrated=False)
+    c.command('manual_step', 0.5)
+    assert b.position == 156
+    c.command('manual_step', 5.0)
+    assert b.position == 200
+    b.emergency_stop_active = True
+    with pytest.raises(RuntimeError):
+        c.command('manual_step', 0.5)
+    assert b.position == 200
+
+
+def test_repeated_manual_enable_is_idempotent_after_torque_is_on():
+    b, c = make_control()
+    b.torque = 0
+    writes = []
+    b.tool_fsm.startup = lambda: b.tool_fsm.state
+    b.set_torque = lambda dxl_id, enabled: (
+        writes.append((dxl_id, enabled)), setattr(b, 'torque', int(enabled)))
+    c.command('manual_enable')
+    c.command('manual_enable')
+    assert writes == [(5, True)]

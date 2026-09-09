@@ -17,6 +17,7 @@ def generate_launch_description():
     start_fsm = LaunchConfiguration('start_fsm')
     read_only = LaunchConfiguration('read_only')
     control_scope = LaunchConfiguration('control_scope')
+    developer_direct_mode = LaunchConfiguration('developer_direct_mode')
     gripper_tolerance = LaunchConfiguration('gripper_target_tolerance_ticks')
     temporary_jog_mode = LaunchConfiguration('temporary_jog_mode')
     dual_single_motor_test = LaunchConfiguration('dual_single_motor_test_mode')
@@ -50,6 +51,9 @@ def generate_launch_description():
         DeclareLaunchArgument('read_only', default_value='false'),
         DeclareLaunchArgument('control_scope', default_value='END_EFFECTOR_ONLY'),
         DeclareLaunchArgument(
+            'developer_direct_mode', default_value='false',
+            description='ID5-only direct bench controls; retains physical safety gates.'),
+        DeclareLaunchArgument(
             'gripper_target_tolerance_ticks', default_value='20'),
         DeclareLaunchArgument('temporary_jog_mode', default_value='false'),
         DeclareLaunchArgument('dual_single_motor_test_mode', default_value='false'),
@@ -78,6 +82,8 @@ def generate_launch_description():
                 'mock_mode': ParameterValue(mock_mode, value_type=bool),
                 'read_only': ParameterValue(read_only, value_type=bool),
                 'control_scope': control_scope,
+                'developer_direct_mode': ParameterValue(
+                    developer_direct_mode, value_type=bool),
                 'gripper_target_tolerance_ticks': ParameterValue(
                     gripper_tolerance, value_type=int),
                 'temporary_jog_mode': ParameterValue(

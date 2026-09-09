@@ -40,6 +40,7 @@ class ManualGuiNode(Node):
         self.declare_parameter('read_only', False)
         self.declare_parameter('tool_type', 'spur_1motor_gripper')
         self.declare_parameter('control_scope', 'FULL_ROBOT')
+        self.declare_parameter('developer_direct_mode', False)
         self.declare_parameter('temporary_jog_mode', False)
         self.declare_parameter('temporary_jog_safe_min_tick', 2867)
         self.declare_parameter('temporary_jog_safe_max_tick', 3807)
@@ -51,6 +52,8 @@ class ManualGuiNode(Node):
         self.selected_tool = str(self.get_parameter('tool_type').value)
         self.control_scope = validate_control_scope(
             self.get_parameter('control_scope').value)
+        self.developer_direct_mode = bool(
+            self.get_parameter('developer_direct_mode').value)
         self.temporary_jog_mode = bool(
             self.get_parameter('temporary_jog_mode').value)
         self.temporary_jog_safe_min = int(
@@ -79,6 +82,8 @@ class ManualGuiNode(Node):
         self.arm_pub = self.create_publisher(
             JointTrajectory, '/arm_controller/joint_trajectory', 10)
         self.cleaner_pub = self.create_publisher(Bool, '/cleaning/enable', 10)
+        self.cleaner_direction_pub = self.create_publisher(
+            String, '/cleaning/direction', 10)
         self.estop_pub = self.create_publisher(Bool, '/tool/emergency_stop', 10)
         self.detach_pub = self.create_publisher(Bool, '/tool/detached', 10)
         self.mode_pub = self.create_publisher(String, '/control/mode', 10)
@@ -362,10 +367,23 @@ class ManualGuiNode(Node):
     def command_cleaner(self, enabled):
         if self.read_only or self.selected_tool != 'cleaner':
             return False
-        if self.control_mode != 'MANUAL':
+        if self.control_mode != 'MANUAL' and not self.developer_direct_mode:
             self.signals.log.emit('Cleaner command blocked: ownership is not MANUAL')
             return
         self.cleaner_pub.publish(Bool(data=bool(enabled)))
+
+    def command_cleaner_direction(self, command):
+        """Low-latency cleaner direction path, separate from the FSM queue."""
+        if self.read_only or self.selected_tool != 'cleaner':
+            return False
+        command = str(command).strip().upper()
+        if command not in ('LEFT', 'RIGHT', 'STOP'):
+            return False
+        if self.control_mode != 'MANUAL' and not self.developer_direct_mode:
+            self.signals.log.emit('Cleaner direction blocked: ownership is not MANUAL')
+            return False
+        self.cleaner_direction_pub.publish(String(data=command))
+        return True
 
     def emergency_stop(self):
         # Hold the manually commanded arm at the latest measured positions using

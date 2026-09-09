@@ -52,6 +52,19 @@ def test_end_effector_scope_blocks_arm_publish_path():
     assert 'CONTROL / TEST SCOPE:' in window_source
 
 
+def test_dashboard_is_scrollable_and_entrypoint_starts_maximized():
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QScrollArea
+
+    _app, window, _goals = _window('END_EFFECTOR_ONLY')
+    assert isinstance(window.centralWidget(), QScrollArea)
+    assert window.scroll_area.widgetResizable()
+    assert window.scroll_area.horizontalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+    assert window.scroll_area.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+    main_source = (ROOT / 'main.py').read_text(encoding='utf-8')
+    assert 'window.showMaximized()' in main_source
+
+
 def test_spur_gui_uses_only_id5_and_requires_explicit_enable():
     ros_source = (ROOT / 'ros_interface.py').read_text(encoding='utf-8')
     window_source = (ROOT / 'main_window.py').read_text(encoding='utf-8')
@@ -114,6 +127,7 @@ def _window(scope):
     goals = []
     node = SimpleNamespace(
         control_scope=scope, selected_tool='dual_motor_gripper', read_only=False,
+        developer_direct_mode=False,
         positions={}, efforts={}, gripper_busy=False,
         request_mode=lambda _mode: None, jog_arm=lambda *_args: None,
         command_arm=lambda *_args: None,
@@ -122,6 +136,7 @@ def _window(scope):
         stop_gripper=lambda: None, command_cleaner=lambda *_args: None,
         emergency_stop=lambda: None, tool_detached=lambda: None,
         set_dual_motor_enabled=lambda *_args: True,
+        command_calibration=lambda *_args, **_kwargs: True,
         manual_dual_recovery_jog=lambda *_args: True,
         command_dual_calibration=lambda *_args, **_kwargs: True)
     profile = {
@@ -475,6 +490,23 @@ def test_spur_manual_ownership_safe_states(monkeypatch, state, allowed):
     window.close()
 
 
+def test_cleaner_in_end_effector_scope_can_request_manual_ownership(monkeypatch):
+    from PyQt5.QtWidgets import QMessageBox
+    _app, window, _commands = _window('END_EFFECTOR_ONLY')
+    try:
+        requests, warnings = [], []
+        window.node.selected_tool = 'cleaner'
+        window.node.request_mode = requests.append
+        window.fsm_state = 'READY'
+        window.mode_combo.setCurrentIndex(window.mode_combo.findData('MANUAL'))
+        monkeypatch.setattr(QMessageBox, 'warning', lambda *_: warnings.append(True))
+        window._request_mode()
+        assert requests == ['MANUAL']
+        assert warnings == []
+    finally:
+        window.close()
+
+
 def test_bridge_accepts_ready_manual_request_without_motor_commands():
     import ast
     source = Path(__file__).parents[2] / 'dynamixel_control/dynamixel_control/moveit_dynamixel_bridge.py'
@@ -539,8 +571,13 @@ def test_spur_enable_uses_current_context_before_motion_allowed():
         assert window.control_mode == window.node.control_mode == 'MANUAL'
         assert window.common_enable.isEnabled()
         assert not window.open_button.isEnabled()
+        status['fsm_state'] = 'STOPPED'
+        window._update_tool_status(status)
+        assert window.common_enable.isEnabled()
+        assert not window.open_button.isEnabled()
         window.common_enable.click()
         assert commands == ['manual_enable']
+        status['fsm_state'] = 'READY'
         status['actuators'][0]['torque_state'] = 'ON'
         # Deliberately leave motion_allowed false: torque readback is authoritative.
         window._update_tool_status(status)
@@ -555,5 +592,37 @@ def test_spur_enable_uses_current_context_before_motion_allowed():
         window._update_tool_status(status)
         assert not window.common_enable.isEnabled()
         assert not window.open_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_developer_direct_panel_uses_id5_without_manual_or_fsm_ownership():
+    _app, window, commands = _window('END_EFFECTOR_ONLY')
+    try:
+        window.node.selected_tool = 'spur_1motor_gripper'
+        window.node.developer_direct_mode = True
+        window.node.command_calibration = (
+            lambda command, **values: (commands.append((command, values)) or True))
+        window._rebuild_tool_control_group()
+        status = _ready_status('END_EFFECTOR_ONLY')
+        status.update(tool_type='spur_1motor_gripper', control_mode='FSM',
+                      fsm_state='STOPPED', motion_allowed=False,
+                      actuators=[dict(id=5, online=True, hardware_error=0,
+                                      position=3000, torque_state='OFF', operating_mode=3)])
+        window._update_tool_status(status)
+        assert window.developer_enable.isEnabled()
+        assert not window.developer_minus.isEnabled()
+        window.developer_enable.click()
+        assert commands == [('manual_enable', {'delta_deg': 0.0})]
+        status['actuators'][0]['torque_state'] = 'ON'
+        window._update_tool_status(status)
+        assert window.developer_minus.isEnabled()
+        window.developer_minus.click()
+        assert commands[-1] == ('manual_step', {'delta_deg': -0.5})
+        window.developer_plus_five.click()
+        assert commands[-1] == ('manual_step', {'delta_deg': 5.0})
+        status['emergency_stop'] = True
+        window._update_tool_status(status)
+        assert not window.developer_plus.isEnabled()
     finally:
         window.close()

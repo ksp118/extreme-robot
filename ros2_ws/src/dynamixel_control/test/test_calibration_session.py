@@ -58,9 +58,10 @@ def test_only_one_click_jogs_write_one_id5_goal():
     session.enable()
     assert session.jog_motor_degrees(0.5) == 2006
     assert session.jog_motor_degrees(-1.0) == 1989
+    assert session.jog_motor_degrees(5.0) == 2057
     assert bridge.writes == [('torque', 5, True), ('goal', 5, 2006),
-                             ('goal', 5, 1989)]
-    for delta in (0, 0.4, 1.5, -2):
+                             ('goal', 5, 1989), ('goal', 5, 2057)]
+    for delta in (0, 0.4, 1.5, -2, 6):
         with pytest.raises(CalibrationSessionError):
             session.jog_motor_degrees(delta)
     assert all(write[1] == 5 for write in bridge.writes)

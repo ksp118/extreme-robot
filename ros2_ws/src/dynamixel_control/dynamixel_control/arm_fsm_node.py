@@ -637,6 +637,8 @@ class ArmFsmNode(Node):
             ChassisMode, '/chassis_mode', self._on_chassis_mode, HEARTBEAT_QOS)
         self.create_subscription(JointState, '/joint_states', self._on_joint_states, 10)
         self.create_subscription(
+            JointState, '/tool/joint_states', self._on_joint_states, 10)
+        self.create_subscription(
             TaskCommand, g('vla_command_topic').value, self._on_task_command, 10)
         # 계약 §5.1 "locked heartbeat는 ... controller fault 0 ... 을 실제 확인한다" —
         # moveit_dynamixel_bridge가 Hardware Error Status를 집계해 발행(내부용 토픽,
@@ -691,6 +693,10 @@ class ArmFsmNode(Node):
         self._prev_state = None
         self.locked = False
         self.pick_target = None
+        self._planned_grasp_pose = None
+        self._planned_approach_pose = None
+        self._planned_grasp_xyz = None
+        self._planned_approach_xyz = None
         self.mission_id = 0
         self.task_command = ''
         self.tool_type = ''
@@ -879,6 +885,7 @@ class ArmFsmNode(Node):
         self.task_command = command
         self.tool_type = self.selected_tool_type
         self._task_result_sent = False
+        self._clear_frozen_target()
         target = DetectedObject()
         target.class_name = msg.target_object
         target.confidence = msg.confidence
@@ -958,6 +965,8 @@ class ArmFsmNode(Node):
         if self.state in pickup_states and msg.status == ARRIVED_PICKUP:
             if msg.mission_id == self._last_completed_mission_id:
                 return  # 이미 완료된 mission_id 재발행 — 재실행 금지
+            if msg.mission_id != self.mission_id:
+                self._clear_frozen_target()
             self.mission_id = msg.mission_id
             if not self.task_command:
                 self.task_command = (
@@ -1114,7 +1123,7 @@ class ArmFsmNode(Node):
         self._transition(State.PLAN)
 
     def _do_plan(self):
-        """파지 목표로 이동 시작. 디스패치만 하고 DESCEND에서 대기."""
+        """안전 게이트를 통과한 검출 하나를 접근/작업 목표로 고정한다."""
         self._set_status(ARM_PLANNING)
         if self.task_command in ('PICK', 'CLEAN') and not self._tool_ready():
             self.get_logger().error(
@@ -1131,20 +1140,6 @@ class ArmFsmNode(Node):
             self._motion_state = 'done'
             self._transition(State.APPROACH)
             return
-        if self.ik_mode == 'moveit':
-            return self._planned_grasp_pose is not None and self._planned_approach_pose is not None
-        return self._planned_grasp_xyz is not None and self._planned_approach_xyz is not None
-
-    def _clear_frozen_target(self):
-        """얼린 타겟을 버린다 — 새 mission 진입 시 호출."""
-        self._planned_grasp_pose = None
-        self._planned_approach_pose = None
-        self._planned_grasp_xyz = None
-        self._planned_approach_xyz = None
-
-    def _do_plan(self):
-        """검출 결과 하나를 고정하고 접근 목표와 파지 목표를 각각 계산한다."""
-        self._set_status(ARM_PLANNING)
         if self.freeze_target_on_retry and self._has_frozen_target():
             # 같은 mission 안의 재시도 — 팔이 시야에 들어와 오염됐을 수 있는 새 관측 대신
             # 처음 얼린 타겟을 그대로 쓴다(파라미터 주석 참고).
@@ -1156,19 +1151,34 @@ class ArmFsmNode(Node):
             if self._planned_grasp_pose is None:
                 self._fail('target pose transform failed')
                 return
-            self._begin_arm_move(grasp_pose)
-            self._transition(State.APPROACH)
-            return
-
-        target = self._grasp_target_xyz()
-        if target is None or not self._move_to_xyz(target):
-            self._set_status(ARM_FAILED)
-            self._transition(State.IDLE)
-            return
+            self._planned_approach_pose = self._offset_pose_z(
+                self._planned_grasp_pose, self.approach_height)
+        else:
+            self._planned_grasp_xyz = self._grasp_target_xyz()
+            if self._planned_grasp_xyz is None:
+                self._fail('target position transform failed')
+                return
+            x, y, z = self._planned_grasp_xyz
+            self._planned_approach_xyz = (x, y, z + self.approach_height)
         self._transition(State.APPROACH)
 
+    def _has_frozen_target(self):
+        """이번 mission에서 이미 고정한 목표가 있는지 IK 경로별로 확인한다."""
+        if self.ik_mode == 'moveit':
+            return (self._planned_grasp_pose is not None
+                    and self._planned_approach_pose is not None)
+        return (self._planned_grasp_xyz is not None
+                and self._planned_approach_xyz is not None)
+
+    def _clear_frozen_target(self):
+        """얼린 타겟을 버린다 — 새 mission 진입 시 호출."""
+        self._planned_grasp_pose = None
+        self._planned_approach_pose = None
+        self._planned_grasp_xyz = None
+        self._planned_approach_xyz = None
+
     def _do_approach(self):
-        """MoveIt 모션 결과 대기 (저속 실행 = 하강 포함). TODO: 접촉 시 arm effort 감시."""
+        """고정한 목표 위의 clearance 자세로 이동한다."""
         self._set_status(ARM_EXECUTING)
         if not self.sensors.obstacle_clear():
             self.get_logger().warn('obstacle sensor blocked/stale → motion cancel')
@@ -1178,11 +1188,19 @@ class ArmFsmNode(Node):
             return
         if self._motion_state == 'active':
             return
-        ok = self._motion_ok
-        self._motion_state = 'idle'
-        self._transition(State.TOOL_ACTION if ok else State.IDLE)
-        if not ok:
-            self._set_status(ARM_FAILED)
+        if self._motion_state == 'done':
+            ok = self._motion_ok
+            self._motion_state = 'idle'
+            if ok:
+                self._transition(
+                    State.TOOL_ACTION if self.dry_run_mode else State.DESCEND)
+            else:
+                self._fail('approach motion failed')
+            return
+        if self.ik_mode == 'moveit':
+            self._begin_arm_move(self._planned_approach_pose)
+        elif not self._move_to_xyz(self._planned_approach_xyz):
+            self._fail('approach IK failed')
 
     def _do_descend(self):
         """Descend from the clearance pose to the frozen grasp pose.
@@ -1204,12 +1222,25 @@ class ArmFsmNode(Node):
             if not self._is_settled():
                 return  # 모션은 끝났다고 보고됐지만 아직 실측 정지 확인 전 — 대기
             self._motion_state = 'idle'
-            self._transition(State.GRASP)
+            self._transition(State.TOOL_ACTION)
             return
         if self.ik_mode == 'moveit':
             self._begin_arm_move(self._planned_grasp_pose)
         elif not self._move_to_xyz(self._planned_grasp_xyz):
             self._fail('descend IK failed')
+
+    def _do_tool_action(self):
+        """선택된 backend에 맞는 기존 작업 상태로만 분기한다."""
+        backend = self.tool_profile.get('backend')
+        if self.task_command == 'PICK' and backend == 'gripper':
+            self._transition(State.GRASP)
+        elif self.task_command == 'CLEAN' and backend == 'cleaner':
+            self._transition(State.CLEAN_START)
+        elif self.task_command == 'MOVE':
+            self._transition(State.RETRACT)
+        else:
+            self._fail_tool_action(
+                f'unsupported task/tool pair: {self.task_command}/{backend}')
 
     def _do_grasp(self):
         """Close the gripper; success evaluation normally belongs to GRASP_CHECK.
@@ -1227,6 +1258,10 @@ class ArmFsmNode(Node):
         if not self._tool_ready():
             self._fail_tool_action('gripper backend became unavailable')
             return
+        if not self._grip_sent:
+            self._send_gripper(self.gripper_close - self.gripper_squeeze_rad)
+            self._grip_sent = True
+            return
         pos = self._joint_position.get(self.gripper_joints[0])
         near_closed = (pos is not None
                        and abs(pos - self.gripper_close) <= self.gripper_empty_pos_tol)
@@ -1240,8 +1275,6 @@ class ArmFsmNode(Node):
             return
         if self._elapsed() >= self.gripper_action_time:
             self._transition(State.GRASP_CHECK)
-        else:
-            self._fail_tool_action('gripper action failed')
 
     def _do_grasp_check(self):
         self._set_status(ARM_EXECUTING)
@@ -1540,18 +1573,18 @@ class ArmFsmNode(Node):
         if self.tool_profile.get('backend') != 'gripper':
             self._transition(State.DONE)
             return
-        if self._gripper_command_state == 'idle':
+        if not self._grip_sent:
             if self.dry_run_mode or self._tool_ready():
                 self._send_gripper(
                     float(self.tool_profile.get('open_position', 1.0)))
             else:
                 # Never invent a motor command after a detach/fault.
                 self._transition(State.DONE)
+                return
+            self._grip_sent = True
             return
-        if self._gripper_command_state == 'active':
-            return
-        self._gripper_command_state = 'idle'
-        self._transition(State.DONE)
+        if self._elapsed() >= self.gripper_action_time:
+            self._transition(State.DONE)
 
     def _do_done(self):
         self._set_status(ARM_EXECUTING)
@@ -2383,12 +2416,12 @@ class ArmFsmNode(Node):
         traj.points.append(pt)
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = traj
-        if not self._grip.server_is_ready():
+        if not self._gripper.server_is_ready():
             # 재발행 경로는 조용히 넘어간다 — 1초마다 같은 경고가 찍히면 진짜 문제가 묻힌다.
             if not refresh:
                 self.get_logger().warn('gripper_controller 액션 서버 미준비')
             return
-        self._grip.send_goal_async(goal)
+        self._gripper.send_goal_async(goal)
 
     def _on_gripper_goal_response(self, future):
         try:
