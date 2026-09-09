@@ -9,7 +9,7 @@ from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rcl_interfaces.msg import SetParametersResult
 from trajectory_msgs.msg import JointTrajectory
@@ -375,7 +375,7 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("tool_type", "spur_1motor_gripper")
         self.declare_parameter("auto_tool_detection", True)
         self.declare_parameter("tool_detection_confirmations", 2)
-        self.declare_parameter("tool_detection_period_s", 0.25)
+        self.declare_parameter("tool_detection_period_s", 0.5)
         self.declare_parameter("control_scope", "FULL_ROBOT")
         self.declare_parameter("temporary_jog_mode", False)
         self.declare_parameter("temporary_jog_safe_min_tick", 2867)
@@ -719,21 +719,36 @@ class MoveItDynamixelBridge(Node):
         self.spur_manual_control = SpurManualControl(self)
         self.create_timer(0.1, self._spur_manual_watchdog)
 
+        # Serial feedback can take longer than its 50 ms timer period on real
+        # U2D2 hardware.  Keep operator/safety commands in their own callback
+        # group so a continuously-ready feedback timer cannot starve them.
+        self._command_group = MutuallyExclusiveCallbackGroup()
+
         self.trajectory_sub = self.create_subscription(
             JointTrajectory,
             "/arm_controller/joint_trajectory",
             self.trajectory_callback,
             10,
+            callback_group=self._command_group,
         )
-        self.create_subscription(Bool, "/cleaning/enable", self._on_cleaning_enable, 10)
-        self.create_subscription(Bool, "/tool/emergency_stop", self._on_emergency_stop, 10)
-        self.create_subscription(Bool, "/tool/detached", self._on_tool_detached, 10)
         self.create_subscription(
-            String, "/control/mode_status", self._on_control_mode, 10)
+            Bool, "/cleaning/enable", self._on_cleaning_enable, 10,
+            callback_group=self._command_group)
         self.create_subscription(
-            String, "/control/mode", self._on_control_mode_request, 10)
+            Bool, "/tool/emergency_stop", self._on_emergency_stop, 10,
+            callback_group=self._command_group)
         self.create_subscription(
-            String, '/fsm/state', self._on_arm_fsm_state, 10)
+            Bool, "/tool/detached", self._on_tool_detached, 10,
+            callback_group=self._command_group)
+        self.create_subscription(
+            String, "/control/mode_status", self._on_control_mode, 10,
+            callback_group=self._command_group)
+        self.create_subscription(
+            String, "/control/mode", self._on_control_mode_request, 10,
+            callback_group=self._command_group)
+        self.create_subscription(
+            String, '/fsm/state', self._on_arm_fsm_state, 10,
+            callback_group=self._command_group)
 
         # 벤치 teleop_core의 단일 관절 명령. 메시지는 [motor_id, goal_tick].
         # FSM/MoveIt 경로와 같은 GroupSyncWrite를 사용하되 알려진 팔 ID만 허용한다.
@@ -746,26 +761,33 @@ class MoveItDynamixelBridge(Node):
         # 요청자가 서보 ID 를 몰라도 되게 하기 위함이다(mission_console 이 이걸 쓴다).
         self.torque_request_sub = self.create_subscription(
             Int32MultiArray, "/dynamixel/torque_request",
-            self.torque_request_callback, 10)
+            self.torque_request_callback, 10,
+            callback_group=self._command_group)
         self.fsm_command_sub = self.create_subscription(
-            String, '/tool/fsm_command', self.fsm_command_callback, 10)
+            String, '/tool/fsm_command', self.fsm_command_callback, 10,
+            callback_group=self._command_group)
         self.tool_change_sub = self.create_subscription(
-            String, '/tool/change', self.tool_change_callback, 10)
+            String, '/tool/change', self.tool_change_callback, 10,
+            callback_group=self._command_group)
         self.calibration_command_sub = self.create_subscription(
             String, '/tool/calibration_command',
-            self.calibration_command_callback, 10)
+            self.calibration_command_callback, 10,
+            callback_group=self._command_group)
         self.manual_recovery_sub = self.create_subscription(
             String, '/tool/manual_recovery_jog',
-            self.manual_recovery_callback, 10)
+            self.manual_recovery_callback, 10,
+            callback_group=self._command_group)
         self.dual_calibration_command_sub = self.create_subscription(
             String, '/tool/dual_calibration_command',
-            self.dual_calibration_command_callback, 10)
+            self.dual_calibration_command_callback, 10,
+            callback_group=self._command_group)
 
         self.teleop_goal_sub = self.create_subscription(
             Int32MultiArray,
             "/dynamixel/goal_position",
             self.teleop_goal_callback,
             10,
+            callback_group=self._command_group,
         )
 
         self._action_group = ReentrantCallbackGroup()
@@ -858,7 +880,7 @@ class MoveItDynamixelBridge(Node):
                 excluded_ids={config['id'] for config in JOINT_CONFIG.values()})
             self.create_timer(
                 self.tool_detection_period_s, self._poll_physical_tool,
-                callback_group=ReentrantCallbackGroup())
+                callback_group=MutuallyExclusiveCallbackGroup())
 
         self.get_logger().info(
             f"MoveIt Dynamixel bridge started (arm={list(JOINT_CONFIG)}, "
