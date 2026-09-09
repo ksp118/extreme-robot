@@ -68,3 +68,16 @@ def test_cleaner_setup_zeros_velocity_before_torque_enable():
                                  source_text.index('    def _cleaner_direction_command')]
     assert 'ADDR_GOAL_VELOCITY' in cleaner_enable
     assert 'ADDR_GOAL_POSITION' not in cleaner_enable
+
+
+def test_cleaner_feedback_falls_back_to_one_id_direct_reads_only():
+    source = Path(__file__).parents[1] / 'dynamixel_control/moveit_dynamixel_bridge.py'
+    text = source.read_text()
+    cleaner_block = text[text.index("if (self.tool_type == 'cleaner'"):
+                         text.index("# The spur tool has exactly one feedback topology")]
+    assert 'self._read_cleaner_sample(self.cleaning_actuator_id)' in cleaner_block
+    method = text[text.index('    def _read_cleaner_sample'):
+                  text.index('    def _read_tool_control_state')]
+    assert 'ADDR_HARDWARE_ERROR_STATUS' in method
+    assert 'ADDR_PRESENT_POSITION' in method
+    assert 'ADDR_PRESENT_LOAD' in method

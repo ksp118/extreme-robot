@@ -3311,6 +3311,12 @@ class MoveItDynamixelBridge(Node):
                 and self.cleaning_actuator_id in self.active_ids):
             sample = self._read_sample(self.cleaning_actuator_id)
             if sample is None:
+                # Some Protocol 2.0 tools answer individual register reads
+                # but not the shared 70–135 SyncRead block.  The cleaner is a
+                # single isolated ID, so a direct read fallback preserves the
+                # same online/HW fail-closed semantics without polling arm IDs.
+                sample = self._read_cleaner_sample(self.cleaning_actuator_id)
+            if sample is None:
                 fault = True
                 self._tool_samples[self.cleaning_actuator_id] = {
                     'id': self.cleaning_actuator_id,
@@ -3495,6 +3501,25 @@ class MoveItDynamixelBridge(Node):
             tick = self.group_sync_read.getData(
                 dxl_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION)
         return feedback_raw, tick, hw_error
+
+    def _read_cleaner_sample(self, dxl_id):
+        """Read one velocity-mode cleaner when its SyncRead block is absent."""
+        try:
+            with self._bus_lock:
+                hw_error = self._read_register(
+                    dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                    'cleaner hardware error')
+                feedback_raw = self._read_register(
+                    dxl_id, ADDR_PRESENT_LOAD, 2,
+                    'cleaner present load', signed=True)
+                tick = self._read_register(
+                    dxl_id, ADDR_PRESENT_POSITION, 4,
+                    'cleaner present position')
+            return feedback_raw, tick, hw_error
+        except Exception as exc:
+            self.get_logger().warn(
+                f'cleaner direct feedback unavailable: id={dxl_id}: {exc}')
+            return None
 
     def _read_tool_control_state(self, dxl_id):
         """Read-only control-table observation for the selected tool only."""
