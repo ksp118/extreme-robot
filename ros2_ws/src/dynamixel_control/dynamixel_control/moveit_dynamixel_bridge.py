@@ -11,6 +11,7 @@ from rclpy.node import Node
 from rclpy.action import ActionServer, GoalResponse, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rcl_interfaces.msg import SetParametersResult
 from trajectory_msgs.msg import JointTrajectory
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Int32MultiArray, String
@@ -399,8 +400,15 @@ class MoveItDynamixelBridge(Node):
 
         self.declare_parameter('centers', EMPTY_STR_ARRAY)
         self.declare_parameter('gear_ratios', EMPTY_STR_ARRAY)
-        self.centers = _parse_centers(self.get_parameter('centers').value)
-        self.gear_ratios = _parse_gear_ratios(self.get_parameter('gear_ratios').value)
+        self.centers, errors = _parse_centers(
+            self.get_parameter('centers').value)
+        for reason in errors:
+            self.get_logger().warn(f"centers: {reason} — 무시")
+        self.gear_ratios, errors = _parse_gear_ratios(
+            self.get_parameter('gear_ratios').value)
+        for reason in errors:
+            self.get_logger().warn(f"gear_ratios: {reason} — 무시")
+        self.add_on_set_parameters_callback(self._on_set_parameters)
         self.gripper_joints = list(self.get_parameter("gripper_joints").value)
         self.gripper_ids = list(self.get_parameter("gripper_ids").value)
         self.gripper_open_rad = float(self.get_parameter("gripper_open_rad").value)
@@ -1603,6 +1611,58 @@ class MoveItDynamixelBridge(Node):
     def _joint_gear_ratio(self, joint_name):
         """실측으로 덮어쓸 수 있는 기어비(`gear_ratios` 파라미터 > JOINT_CONFIG 기본값)."""
         return self.gear_ratios.get(joint_name, JOINT_CONFIG[joint_name]["gear_ratio"])
+
+    def _on_set_parameters(self, params):
+        """검증한 캘리브 값만 원자적으로 런타임 변환식에 반영한다."""
+        centers, ratios = None, None
+        gripper = {}
+        for param in params:
+            if param.name == 'centers':
+                centers, errors = _parse_centers(param.value)
+                if errors:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"centers: {'; '.join(errors)}")
+            elif param.name == 'gear_ratios':
+                ratios, errors = _parse_gear_ratios(param.value)
+                if errors:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=f"gear_ratios: {'; '.join(errors)}")
+            elif param.name in ('gripper_open_tick', 'gripper_close_tick'):
+                gripper[param.name] = int(param.value)
+
+        if gripper:
+            open_tick = gripper.get(
+                'gripper_open_tick', self.gripper_open_tick)
+            close_tick = gripper.get(
+                'gripper_close_tick', self.gripper_close_tick)
+            if abs(open_tick - close_tick) < calib_math.MIN_GRIPPER_SPAN_TICK:
+                return SetParametersResult(
+                    successful=False,
+                    reason=(f"그리퍼 개폐 tick 차이가 "
+                            f"{abs(open_tick - close_tick)} 밖에 안 됩니다 — "
+                            "잘못 측정된 값입니다"))
+
+        changed = []
+        if centers is not None:
+            self.centers = centers
+            changed.append(f'centers={centers}')
+        if ratios is not None:
+            self.gear_ratios = ratios
+            changed.append(f'gear_ratios={ratios}')
+        for name, value in gripper.items():
+            setattr(self, name, value)
+            changed.append(f'{name}={value}')
+
+        if changed:
+            self.get_logger().info('캘리브 런타임 반영: ' + ', '.join(changed))
+            if not self.read_only:
+                self.get_logger().warn(
+                    '⚠️ 토크가 살아 있는 상태에서 캘리브가 바뀌었다 — 다음 '
+                    '명령부터 rad↔tick 변환이 달라진다. 측정은 '
+                    'read_only:=true 에서 할 것.')
+        return SetParametersResult(successful=True)
 
     def _read_register(self, dxl_id, address, size, label, signed=False):
         reader = {
