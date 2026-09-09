@@ -19,6 +19,7 @@ def generate_launch_description():
     start_fsm = LaunchConfiguration('start_fsm')
     tool_type = LaunchConfiguration('tool_type')
     control_scope = LaunchConfiguration('control_scope')
+    developer_direct_mode = LaunchConfiguration('developer_direct_mode')
     gripper_tolerance = LaunchConfiguration('gripper_target_tolerance_ticks')
     temporary_jog_mode = LaunchConfiguration('temporary_jog_mode')
     dual_single_motor_test = LaunchConfiguration('dual_single_motor_test_mode')
@@ -43,6 +44,8 @@ def generate_launch_description():
             'read_only': read_only,
             'tool_type': tool_type,
             'control_scope': control_scope,
+            'developer_direct_mode': ParameterValue(
+                developer_direct_mode, value_type=bool),
             'gripper_target_tolerance_ticks': gripper_tolerance,
             'temporary_jog_mode': temporary_jog_mode,
             'dual_single_motor_test_mode': dual_single_motor_test,
@@ -88,6 +91,9 @@ def generate_launch_description():
             'control_scope', default_value='FULL_ROBOT',
             description='Arm joints 1–5 and the interchangeable tool share one bridge.'),
         DeclareLaunchArgument(
+            'developer_direct_mode', default_value='false',
+            description='ID5-only direct bench controls; retains physical safety gates.'),
+        DeclareLaunchArgument(
             'gripper_target_tolerance_ticks', default_value='20'),
         DeclareLaunchArgument('temporary_jog_mode', default_value='false'),
         DeclareLaunchArgument(
@@ -117,6 +123,8 @@ def generate_launch_description():
                 'read_only': ParameterValue(read_only, value_type=bool),
                 'tool_type': tool_type,
                 'control_scope': control_scope,
+                'developer_direct_mode': ParameterValue(
+                    developer_direct_mode, value_type=bool),
                 'temporary_jog_mode': ParameterValue(
                     temporary_jog_mode, value_type=bool),
                 'dual_single_motor_test_mode': ParameterValue(

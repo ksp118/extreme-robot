@@ -43,3 +43,17 @@ def test_gate_blocks_without_writes(field, value):
     with pytest.raises(RuntimeError):
         c.command('manual_open')
     assert b.position == 150
+
+
+def test_developer_direct_mode_bypasses_fsm_ownership_but_not_hardware_gates():
+    b, c = make_control()
+    b.developer_direct_mode = True
+    b.control_mode = 'FSM'
+    b.tool_fsm.state.name = 'STOPPED'
+    b.tool_profile.update(safe_min_tick=100, safe_max_tick=200, calibrated=False)
+    c.command('manual_step', 0.5)
+    assert b.position == 156
+    b.emergency_stop_active = True
+    with pytest.raises(RuntimeError):
+        c.command('manual_step', 0.5)
+    assert b.position == 156

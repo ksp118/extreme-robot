@@ -127,6 +127,7 @@ def _window(scope):
     goals = []
     node = SimpleNamespace(
         control_scope=scope, selected_tool='dual_motor_gripper', read_only=False,
+        developer_direct_mode=False,
         positions={}, efforts={}, gripper_busy=False,
         request_mode=lambda _mode: None, jog_arm=lambda *_args: None,
         command_arm=lambda *_args: None,
@@ -135,6 +136,7 @@ def _window(scope):
         stop_gripper=lambda: None, command_cleaner=lambda *_args: None,
         emergency_stop=lambda: None, tool_detached=lambda: None,
         set_dual_motor_enabled=lambda *_args: True,
+        command_calibration=lambda *_args, **_kwargs: True,
         manual_dual_recovery_jog=lambda *_args: True,
         command_dual_calibration=lambda *_args, **_kwargs: True)
     profile = {
@@ -573,5 +575,35 @@ def test_spur_enable_uses_current_context_before_motion_allowed():
         window._update_tool_status(status)
         assert not window.common_enable.isEnabled()
         assert not window.open_button.isEnabled()
+    finally:
+        window.close()
+
+
+def test_developer_direct_panel_uses_id5_without_manual_or_fsm_ownership():
+    _app, window, commands = _window('END_EFFECTOR_ONLY')
+    try:
+        window.node.selected_tool = 'spur_1motor_gripper'
+        window.node.developer_direct_mode = True
+        window.node.command_calibration = (
+            lambda command, **values: (commands.append((command, values)) or True))
+        window._rebuild_tool_control_group()
+        status = _ready_status('END_EFFECTOR_ONLY')
+        status.update(tool_type='spur_1motor_gripper', control_mode='FSM',
+                      fsm_state='STOPPED', motion_allowed=False,
+                      actuators=[dict(id=5, online=True, hardware_error=0,
+                                      position=3000, torque_state='OFF', operating_mode=3)])
+        window._update_tool_status(status)
+        assert window.developer_enable.isEnabled()
+        assert not window.developer_minus.isEnabled()
+        window.developer_enable.click()
+        assert commands == [('manual_enable', {'delta_deg': 0.0})]
+        status['actuators'][0]['torque_state'] = 'ON'
+        window._update_tool_status(status)
+        assert window.developer_minus.isEnabled()
+        window.developer_minus.click()
+        assert commands[-1] == ('manual_step', {'delta_deg': -0.5})
+        status['emergency_stop'] = True
+        window._update_tool_status(status)
+        assert not window.developer_plus.isEnabled()
     finally:
         window.close()

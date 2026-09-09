@@ -327,13 +327,48 @@ class ManualMainWindow(QMainWindow):
                 'captured_endpoints_label', 'validate_calibration',
                 'save_calibration', 'spur_mapping', 'spur_minus_5',
                 'spur_zero', 'spur_plus_5', 'motor_minus_half', 'motor_plus_half',
-                'motor_minus_one', 'motor_plus_one'):
+                'motor_minus_one', 'motor_plus_one', 'developer_direct_box',
+                'developer_enable', 'developer_disable', 'developer_minus',
+                'developer_plus', 'developer_hold'):
             setattr(self, name, None)
         box = QGroupBox(ko('End Effector'))
         layout = QVBoxLayout(box)
         self.profile_text = QLabel(ko(self._profile_summary()))
         self.profile_text.setWordWrap(True)
         layout.addWidget(self.profile_text)
+        if (getattr(self.node, 'developer_direct_mode', False)
+                and self.node.selected_tool == 'spur_1motor_gripper'
+                and self.node.control_scope == 'END_EFFECTOR_ONLY'):
+            self.developer_direct_box = QGroupBox(ko('개발자 직접 구동 · ID 5 전용'))
+            self.developer_direct_box.setStyleSheet(
+                'QGroupBox { font-weight: bold; color: #7a4100; }')
+            developer = QGridLayout(self.developer_direct_box)
+            notice = QLabel(ko(
+                '수동 권한·FSM·보정 절차 없이 즉시 시험합니다. '
+                '비상 정지, 오류, 오프라인, 안전 범위는 계속 차단됩니다.'))
+            notice.setWordWrap(True)
+            developer.addWidget(notice, 0, 0, 1, 3)
+            self.developer_enable = QPushButton(ko('토크 켜기'))
+            self.developer_disable = QPushButton(ko('토크 끄기'))
+            self.developer_hold = QPushButton(ko('현재 위치 정지'))
+            self.developer_minus = QPushButton(ko('−0.5°'))
+            self.developer_plus = QPushButton(ko('+0.5°'))
+            self.developer_enable.clicked.connect(
+                lambda: self._developer_spur_command('manual_enable'))
+            self.developer_disable.clicked.connect(
+                lambda: self._developer_spur_command('manual_disable'))
+            self.developer_hold.clicked.connect(
+                lambda: self._developer_spur_command('manual_hold'))
+            self.developer_minus.clicked.connect(
+                lambda: self._developer_spur_command('manual_step', -0.5))
+            self.developer_plus.clicked.connect(
+                lambda: self._developer_spur_command('manual_step', 0.5))
+            developer.addWidget(self.developer_enable, 1, 0)
+            developer.addWidget(self.developer_disable, 1, 1)
+            developer.addWidget(self.developer_hold, 1, 2)
+            developer.addWidget(self.developer_minus, 2, 0, 1, 2)
+            developer.addWidget(self.developer_plus, 2, 2)
+            layout.addWidget(self.developer_direct_box)
         if not hasattr(self, 'common_enable'):
             self.open_button = QPushButton(ko('OPEN'))
             self.close_button = QPushButton(ko('CLOSE'))
@@ -554,6 +589,29 @@ class ManualMainWindow(QMainWindow):
             (self._enable_dual_motors if enabled else self._disable_dual_motors)()
         elif self.node.selected_tool == 'spur_1motor_gripper':
             self.node.command_calibration('manual_enable' if enabled else 'manual_disable')
+
+    def _developer_spur_ready(self):
+        sample = self._gripper_samples().get(5, {})
+        return bool(
+            getattr(self.node, 'developer_direct_mode', False)
+            and self.node.selected_tool == 'spur_1motor_gripper'
+            and self.node.control_scope == 'END_EFFECTOR_ONLY'
+            and self.tool_status.get('tool_type') == 'spur_1motor_gripper'
+            and self._status_fresh()
+            and not self.tool_status.get('read_only')
+            and not getattr(self.node, 'read_only', False)
+            and not self.tool_status.get('emergency_stop')
+            and not self.tool_status.get('tool_detached')
+            and sample.get('online') and sample.get('hardware_error') == 0
+            and isinstance(sample.get('position'), int))
+
+    def _developer_spur_command(self, command, delta_deg=0.0):
+        if not self._developer_spur_ready():
+            self._append_log('개발자 직접 구동 차단: ID5 실시간 안전 상태를 확인하세요')
+            return
+        if self.node.command_calibration(command, delta_deg=float(delta_deg)):
+            detail = f' {delta_deg:+.1f}°' if command == 'manual_step' else ''
+            self._append_log(f'개발자 직접 구동 요청: {command}{detail}')
 
     def _common_hold(self, direction):
         if self.node.selected_tool == 'dual_motor_gripper':
@@ -1156,6 +1214,20 @@ class ManualMainWindow(QMainWindow):
             spur and manual and bool(self.tool_status.get('calibration_jog_enabled'))
             and not calibration.get('active', False))
         self._refresh_common_buttons()
+        self._refresh_developer_direct_buttons()
+
+    def _refresh_developer_direct_buttons(self):
+        """Keep the optional bench panel independent of FSM/manual ownership."""
+        if not getattr(self, 'developer_direct_box', None):
+            return
+        sample = self._gripper_samples().get(5, {})
+        ready = self._developer_spur_ready()
+        torque_on = sample.get('torque_state') == 'ON'
+        self.developer_enable.setEnabled(ready and not torque_on)
+        self.developer_disable.setEnabled(ready and torque_on)
+        self.developer_hold.setEnabled(ready and torque_on)
+        self.developer_minus.setEnabled(ready and torque_on)
+        self.developer_plus.setEnabled(ready and torque_on)
 
     def _spur_manual_ready(self):
         return (self._spur_enable_ready()

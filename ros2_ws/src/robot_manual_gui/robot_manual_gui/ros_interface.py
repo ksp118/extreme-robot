@@ -40,6 +40,7 @@ class ManualGuiNode(Node):
         self.declare_parameter('read_only', False)
         self.declare_parameter('tool_type', 'spur_1motor_gripper')
         self.declare_parameter('control_scope', 'FULL_ROBOT')
+        self.declare_parameter('developer_direct_mode', False)
         self.declare_parameter('temporary_jog_mode', False)
         self.declare_parameter('temporary_jog_safe_min_tick', 2867)
         self.declare_parameter('temporary_jog_safe_max_tick', 3807)
@@ -51,6 +52,8 @@ class ManualGuiNode(Node):
         self.selected_tool = str(self.get_parameter('tool_type').value)
         self.control_scope = validate_control_scope(
             self.get_parameter('control_scope').value)
+        self.developer_direct_mode = bool(
+            self.get_parameter('developer_direct_mode').value)
         self.temporary_jog_mode = bool(
             self.get_parameter('temporary_jog_mode').value)
         self.temporary_jog_safe_min = int(

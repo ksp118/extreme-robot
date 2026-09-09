@@ -377,6 +377,10 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("tool_detection_confirmations", 2)
         self.declare_parameter("tool_detection_period_s", 0.5)
         self.declare_parameter("control_scope", "FULL_ROBOT")
+        # Explicit, ID5-only bench path.  It bypasses GUI/FSM ownership
+        # ceremony, never the hardware-health, E-stop, detached, range, or
+        # read-only gates enforced by SpurManualControl.
+        self.declare_parameter("developer_direct_mode", False)
         self.declare_parameter("temporary_jog_mode", False)
         self.declare_parameter("temporary_jog_safe_min_tick", 2867)
         self.declare_parameter("temporary_jog_safe_max_tick", 3807)
@@ -469,6 +473,14 @@ class MoveItDynamixelBridge(Node):
         self._arm_fsm_state = None
         self.control_scope = validate_control_scope(
             self.get_parameter("control_scope").value)
+        self.developer_direct_mode = bool(
+            self.get_parameter('developer_direct_mode').value)
+        if self.developer_direct_mode and (
+                self.control_scope != 'END_EFFECTOR_ONLY'
+                or self.tool_type != 'spur_1motor_gripper'):
+            raise ValueError(
+                'developer_direct_mode requires spur_1motor_gripper '
+                'with END_EFFECTOR_ONLY scope')
         # The isolated end-effector stack must never poll or command arm IDs.
         self.gripper_only_mode = self.control_scope == 'END_EFFECTOR_ONLY'
         self.temporary_jog_mode = bool(
@@ -2296,6 +2308,7 @@ class MoveItDynamixelBridge(Node):
             'endpoint_calibration_verified': bool(
                 self.tool_profile.get('endpoint_calibration_verified')),
             'temporary_jog_mode': self.temporary_jog_enabled,
+            'developer_direct_mode': self.developer_direct_mode,
             'temporary_jog_ready': self._tool_backend_ready(),
             'tool_enable_allowed': self._tool_enable_allowed(),
             # This is a register observation, never the bridge's ownership
