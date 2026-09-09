@@ -735,6 +735,11 @@ class MoveItDynamixelBridge(Node):
         # U2D2 hardware.  Keep operator/safety commands in their own callback
         # group so a continuously-ready feedback timer cannot starve them.
         self._command_group = MutuallyExclusiveCallbackGroup()
+        # Bench cleaner START/STOP is deliberately latency-sensitive.  It has
+        # its own executor group and still serializes actual bus access with
+        # _bus_lock, so feedback cannot corrupt a packet while policy/FSM work
+        # in the normal command queue cannot delay the operator's button.
+        self._cleaner_direct_group = ReentrantCallbackGroup()
 
         self.trajectory_sub = self.create_subscription(
             JointTrajectory,
@@ -745,7 +750,7 @@ class MoveItDynamixelBridge(Node):
         )
         self.create_subscription(
             Bool, "/cleaning/enable", self._on_cleaning_enable, 10,
-            callback_group=self._command_group)
+            callback_group=self._cleaner_direct_group)
         self.create_subscription(
             Bool, "/tool/emergency_stop", self._on_emergency_stop, 10,
             callback_group=self._command_group)
@@ -2660,9 +2665,17 @@ class MoveItDynamixelBridge(Node):
     def _on_cleaning_enable(self, msg, rotation=1):
         if self.tool_type != 'cleaner' or self.read_only:
             return
+        direct_bench = bool(
+            self.developer_direct_mode
+            and self.control_scope == 'END_EFFECTOR_ONLY')
+        # Developer direct mode deliberately skips ownership/FSM readiness so
+        # a bench START/STOP has no status-poll or mode-transition wait.  It
+        # does not bypass the physical tool identity, read-only mode, e-stop,
+        # detach latch, configured actuator, or the shared serial-bus lock.
         if msg.data and (self.emergency_stop_active or self.tool_detached
-                         or not self.tool_motion_allowed
-                         or self.control_mode not in ('MANUAL', 'FSM')):
+                         or (not direct_bench and not self.tool_motion_allowed)
+                         or (not direct_bench
+                             and self.control_mode not in ('MANUAL', 'FSM'))):
             return
         if self.mock_mode:
             self.cleaning_running = bool(msg.data)
@@ -2672,7 +2685,9 @@ class MoveItDynamixelBridge(Node):
                 sample['velocity'] = (rotation * self.cleaning_direction * self.cleaning_velocity_raw
                                       if msg.data else 0)
             return
-        if not self.cleaning_configured or (msg.data and not self._tool_backend_ready()):
+        if (not self.cleaning_configured or not self.tool_discovered
+                or (msg.data and not direct_bench
+                    and not self._tool_backend_ready())):
             self.get_logger().error('Cleaning actuator/profile is not ready')
             return
         velocity = (rotation * self.cleaning_direction * self.cleaning_velocity_raw

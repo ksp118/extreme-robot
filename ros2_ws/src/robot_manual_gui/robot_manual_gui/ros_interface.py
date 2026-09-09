@@ -365,7 +365,7 @@ class ManualGuiNode(Node):
     def command_cleaner(self, enabled):
         if self.read_only or self.selected_tool != 'cleaner':
             return False
-        if self.control_mode != 'MANUAL':
+        if self.control_mode != 'MANUAL' and not self.developer_direct_mode:
             self.signals.log.emit('Cleaner command blocked: ownership is not MANUAL')
             return
         self.cleaner_pub.publish(Bool(data=bool(enabled)))

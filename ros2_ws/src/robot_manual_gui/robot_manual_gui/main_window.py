@@ -1191,9 +1191,18 @@ class ManualMainWindow(QMainWindow):
         self.gripper_jog_step.setEnabled(not self.gripper_busy)
         cleaner = self.node.selected_tool == 'cleaner'
         configured = bool(self.tool_status.get('actuators_discovered'))
-        self.clean_start.setEnabled(manual and cleaner and profile_ok
-                                    and motion and configured)
-        self.clean_stop.setEnabled(manual and cleaner and profile_ok and motion)
+        cleaner_direct = bool(
+            cleaner and getattr(self.node, 'developer_direct_mode', False)
+            and self.node.control_scope == 'END_EFFECTOR_ONLY'
+            and not bool(self.tool_status.get('read_only'))
+            and not bool(self.tool_status.get('emergency_stop'))
+            and not bool(self.tool_status.get('tool_detached'))
+            and configured)
+        self.clean_start.setEnabled(
+            cleaner_direct or (manual and cleaner and profile_ok
+                               and motion and configured))
+        self.clean_stop.setEnabled(
+            cleaner_direct or (manual and cleaner and profile_ok and motion))
         for widget in (self.spur_minus_5, self.spur_zero, self.spur_plus_5):
             if widget is not None:
                 widget.setEnabled(False)
