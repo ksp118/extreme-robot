@@ -34,6 +34,28 @@ def test_bus_identity_excludes_arm_id_profiles():
     assert provider.detected_tool_type() is None
 
 
+def test_explicit_rescan_keeps_observed_signature_for_diagnostics():
+    bridge = object.__new__(MoveItDynamixelBridge)
+    provider = BusToolIdentityProvider(
+        PROFILES, lambda actuator_id: actuator_id == 5)
+    bridge._bus_tool_identity = provider
+    bridge.mock_mode = False
+    bridge.port_connected = True
+    bridge._tool_detection_reason = ''
+    assert bridge._rescan_physical_tool() == 'spur_1motor_gripper'
+    assert provider.last_present_ids == {5}
+    assert bridge._tool_detection_reason == ''
+
+
+def test_profile_discovery_uses_the_shared_bus_lock():
+    """The profile ping path must not race the periodic signature probe."""
+    source = (__import__('pathlib').Path(__file__).parents[1] /
+              'dynamixel_control/moveit_dynamixel_bridge.py').read_text()
+    start = source.index('    def _discover_tool_ids')
+    end = source.index('    def _probe_tool_id', start)
+    assert 'with self._bus_lock:' in source[start:end]
+
+
 def _bridge(observations):
     bridge = object.__new__(MoveItDynamixelBridge)
     bridge._bus_tool_identity = SimpleNamespace(

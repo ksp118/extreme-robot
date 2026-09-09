@@ -899,6 +899,14 @@ class ManualMainWindow(QMainWindow):
         if not status.get('profile_valid'):
             return '도구 설정이 유효하지 않음'
         if not status.get('actuators_discovered'):
+            detected = (status.get('automatic_detection') or {}).get(
+                'present_ids') or []
+            expected = (status.get('tool_profile') or {}).get(
+                'actuator_ids') or []
+            if detected and expected:
+                return ('선택 도구와 연결 모터 번호가 다름 '
+                        f'(감지: {", ".join(map(str, detected))}, '
+                        f'기대: {", ".join(map(str, expected))})')
             return '도구 모터 미감지'
         if not status.get('calibrated'):
             return '보정 필요'

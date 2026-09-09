@@ -330,5 +330,10 @@ def test_block_reason_names_the_active_latch():
         status['actuators_discovered'] = False
         window._update_tool_status(status)
         assert window._tool_block_reason() == '도구 모터 미감지'
+        status['automatic_detection'] = {'present_ids': [5]}
+        status['tool_profile'] = {'actuator_ids': [2]}
+        window._update_tool_status(status)
+        assert window._tool_block_reason() == (
+            '선택 도구와 연결 모터 번호가 다름 (감지: 5, 기대: 2)')
     finally:
         window.close()

@@ -1908,15 +1908,22 @@ class MoveItDynamixelBridge(Node):
             raise RuntimeError('ID5 current-position goal readback mismatch')
 
     def _discover_tool_ids(self):
-        """Ping every configured actuator; any missing ID closes the backend."""
+        """Ping every configured actuator; any missing ID closes the backend.
+
+        Discovery is invoked by startup, an explicit GUI request and the
+        physical-detector timer.  It must share the serial lock with the
+        one-ID probes; otherwise a periodic probe can interleave packets with
+        this loop and turn a present motor into a false "not discovered".
+        """
         if not self.tool_ids:
             return False
         missing = []
-        for dxl_id in self.tool_ids:
-            _model, result, error = self.packet_handler.ping(
-                self.port_handler, dxl_id)
-            if result != 0 or error != 0:
-                missing.append(dxl_id)
+        with self._bus_lock:
+            for dxl_id in self.tool_ids:
+                _model, result, error = self.packet_handler.ping(
+                    self.port_handler, dxl_id)
+                if result != 0 or error != 0:
+                    missing.append(dxl_id)
         if missing:
             self.get_logger().error(f'tool actuator IDs not discovered: {missing}')
             return False
@@ -1928,6 +1935,52 @@ class MoveItDynamixelBridge(Node):
             _model, result, error = self.packet_handler.ping(
                 self.port_handler, int(dxl_id))
         return result == 0 and error == 0
+
+    def _rescan_physical_tool(self):
+        """Probe every configured tool signature and retain the observation.
+
+        This is intentionally an ID/signature scan, rather than trusting the
+        GUI's selected profile.  It is used both by the periodic detector and
+        by an explicit tool-change request, so the latter is a real rescan as
+        an operator reasonably expects.
+        """
+        provider = self._bus_tool_identity
+        if provider is None or self.mock_mode or not self.port_connected:
+            return None
+        detected = provider.detected_tool_type()
+        self._tool_detection_reason = provider.last_reason
+        return detected
+
+    def _revalidate_current_tool(self):
+        """Handle an explicit request for the already selected tool safely.
+
+        A same-name request used to return immediately.  That left a freshly
+        reconnected actuator offline until the background poll happened to run
+        and made the GUI misleadingly report an undetected motor.  Re-register
+        feedback and re-run FSM validation here, but never enable torque.
+        """
+        if self.mock_mode:
+            return
+        if not self.port_connected:
+            self.tool_discovered = False
+            self.tool_motion_allowed = False
+            raise RuntimeError('tool bus is not connected')
+        self.tool_discovered = self._discover_tool_ids()
+        if not self.tool_discovered:
+            self.tool_motion_allowed = False
+            raise RuntimeError(
+                f'{self.tool_type} re-scan found none of expected actuator IDs '
+                f'{self.tool_ids}')
+        for dxl_id in self.tool_ids:
+            self.group_sync_read.addParam(dxl_id)
+            self.active_ids.add(dxl_id)
+        self.tool_motion_allowed = bool(
+            self.tool_selection and self.tool_selection.valid)
+        if self.tool_fsm is not None:
+            state = self.tool_fsm.startup()
+            if state == ToolState.FAULT:
+                raise RuntimeError(self.tool_fsm.fault_reason or
+                                   'tool re-scan validation failed')
 
     def _confirmed_tool_observation(self, detected):
         """Return true once one observation is stable for the configured count."""
@@ -1954,7 +2007,7 @@ class MoveItDynamixelBridge(Node):
             self._tool_detection_reason = (
                 f'{self.tool_type} has no physical actuator signature')
             return
-        detected = provider.detected_tool_type()
+        detected = self._rescan_physical_tool()
         if not self._confirmed_tool_observation(detected):
             return
 
@@ -2139,6 +2192,7 @@ class MoveItDynamixelBridge(Node):
             raise ToolProfileError(
                 f'runtime switching supports only {supported}, got {requested!r}')
         if requested == self.tool_type:
+            self._revalidate_current_tool()
             return
         if self.emergency_stop_active or self.tool_detached:
             raise RuntimeError('runtime tool change blocked by emergency stop or detached latch')
@@ -2173,6 +2227,19 @@ class MoveItDynamixelBridge(Node):
                 raise ToolProfileError('cleaner requires one actuator and one joint')
             if new_ids[0] in ARM_IDS:
                 raise ToolProfileError('cleaner actuator conflicts with an arm joint')
+
+        # An operator's request is also an explicit physical rescan.  Do this
+        # before stopping/unregistering the active tool so a wrong selection
+        # cannot leave a healthy tool half-switched.  The error names the
+        # observed IDs instead of incorrectly calling the motor "undetected".
+        if not self.mock_mode and self.port_connected:
+            detected = self._rescan_physical_tool()
+            present = sorted(self._bus_tool_identity.last_present_ids)
+            if detected != requested:
+                raise ToolProfileError(
+                    f'requested {requested} expects actuator IDs {new_ids}; '
+                    f'bus re-scan found IDs {present} '
+                    f'({detected or self._bus_tool_identity.last_reason})')
 
         # Stop and unregister the old tool before changing the allowlist.  This
         # New cleaner velocity-mode setup follows discovery below.
