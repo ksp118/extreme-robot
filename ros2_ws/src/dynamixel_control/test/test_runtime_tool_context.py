@@ -83,6 +83,20 @@ def test_cleaner_feedback_falls_back_to_one_id_direct_reads_only():
     assert 'ADDR_PRESENT_LOAD' in method
 
 
+def test_spur_feedback_falls_back_to_direct_reads_after_tool_swap():
+    source = Path(__file__).parents[1] / 'dynamixel_control/moveit_dynamixel_bridge.py'
+    text = source.read_text()
+    spur_block = text[text.index('if self.tool_ids == [5]:'):
+                      text.index('# Legacy dual-gripper feedback',
+                                 text.index('if self.tool_ids == [5]:'))]
+    assert 'self._read_spur_sample(dxl_id)' in spur_block
+    method = text[text.index('    def _read_spur_sample'):
+                  text.index('    def _read_tool_control_state')]
+    assert 'ADDR_HARDWARE_ERROR_STATUS' in method
+    assert 'ADDR_PRESENT_POSITION' in method
+    assert 'ADDR_PRESENT_LOAD' in method
+
+
 def test_cleaner_velocity_write_uses_the_shared_bus_lock():
     source = Path(__file__).parents[1] / 'dynamixel_control/moveit_dynamixel_bridge.py'
     text = source.read_text()

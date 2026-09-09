@@ -3457,6 +3457,12 @@ class MoveItDynamixelBridge(Node):
             else:
                 sample = self._read_sample(dxl_id)
                 if sample is None:
+                    # A GroupSyncRead parameter can remain stale across a
+                    # cleaner→spur profile swap even though ID5 answers direct
+                    # packets.  Do not present that reachable actuator as
+                    # offline and permanently block the explicit torque gate.
+                    sample = self._read_spur_sample(dxl_id)
+                if sample is None:
                     fault = True
                     self._tool_samples[dxl_id] = {
                         'id': dxl_id, 'joint': joint_names[0] if joint_names else '',
@@ -3622,6 +3628,25 @@ class MoveItDynamixelBridge(Node):
         except Exception as exc:
             self.get_logger().warn(
                 f'cleaner direct feedback unavailable: id={dxl_id}: {exc}')
+            return None
+
+    def _read_spur_sample(self, dxl_id):
+        """Read ID5 directly when SyncRead was not rebuilt after a tool swap."""
+        try:
+            with self._bus_lock:
+                hw_error = self._read_register(
+                    dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                    'spur hardware error')
+                feedback_raw = self._read_register(
+                    dxl_id, ADDR_PRESENT_LOAD, 2,
+                    'spur present load', signed=True)
+                tick = self._read_register(
+                    dxl_id, ADDR_PRESENT_POSITION, 4,
+                    'spur present position')
+            return feedback_raw, tick, hw_error
+        except Exception as exc:
+            self.get_logger().warn(
+                f'spur direct feedback unavailable: id={dxl_id}: {exc}')
             return None
 
     def _read_tool_control_state(self, dxl_id):
