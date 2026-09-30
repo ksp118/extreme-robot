@@ -93,11 +93,11 @@ def test_full_robot_shared_buttons_preserve_arm_and_fsm(monkeypatch, tmp_path):
             assert arm.tool_profile == json.loads(json.dumps(bridge.tool_profile))
             assert all(arm._joint_position[n] == expected[n] for n in arm_names)
             assert all(gui.positions[n] == expected[n] for n in arm_names)
+            wait_for(lambda: window.common_enable.isEnabled())
+            window.common_enable.click()
+            wait_for(lambda: all(bridge._tool_samples[i]['torque_state'] == 'ON' for i in ids)
+                     and window.close_button.isEnabled())
             if tool != 'cleaner':
-                wait_for(lambda: window.common_enable.isEnabled())
-                window.common_enable.click()
-                wait_for(lambda: all(bridge.read_torque(i) == 1 for i in ids)
-                         and window.close_button.isEnabled())
                 common[0].click()
                 wait_for(lambda: window.fsm_state == 'CLOSED')
                 endpoints = bridge.tool_profile.get('motor_endpoints')
@@ -130,9 +130,6 @@ def test_full_robot_shared_buttons_preserve_arm_and_fsm(monkeypatch, tmp_path):
                                window.common_disable, window.read_diag}
         assert action_server is (bridge.action_server if hasattr(bridge, 'action_server') else None)
     finally:
-        window.close()
-        executor.shutdown()
-        arm._fk_node.destroy_node()
-        for node in (gui, arm, bridge):
-            node.destroy_node()
-        rclpy.shutdown()
+        from conftest import shutdown_qt_ros_runtime
+        shutdown_qt_ros_runtime(
+            app, window, executor, (arm._fk_node, gui, arm, bridge), rclpy)

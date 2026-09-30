@@ -8,7 +8,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Int32MultiArray, String
+from std_msgs.msg import Bool, Int32MultiArray, MultiArrayDimension, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
@@ -47,6 +47,7 @@ class ManualGuiNode(Node):
         self.declare_parameter('temporary_jog_mechanical_open_tick', 2817)
         self.declare_parameter('temporary_jog_mechanical_close_tick', 3857)
         self.declare_parameter('calibration_jog_mode', False)
+        self.declare_parameter('keyboard_shortcuts_enabled', True)
         self.mock_mode = bool(self.get_parameter('mock_mode').value)
         self.read_only = bool(self.get_parameter('read_only').value)
         self.selected_tool = str(self.get_parameter('tool_type').value)
@@ -62,12 +63,23 @@ class ManualGuiNode(Node):
             self.get_parameter('temporary_jog_safe_max_tick').value)
         self.calibration_jog_mode = bool(
             self.get_parameter('calibration_jog_mode').value)
+        self.keyboard_shortcuts_enabled = bool(
+            self.get_parameter('keyboard_shortcuts_enabled').value)
         self.positions = {name: 0.0 for name in ARM_JOINTS}
         self.efforts = {name: 0.0 for name in ARM_JOINTS}
         self.control_mode = 'FSM'
         self.fsm_state = 'UNKNOWN'
         self.last_gripper_goal = None
         self.gripper_busy = False
+        self.tool_profile = {}
+        self.actuator_ids = []
+        # Only /tool/status may advance this runtime identity.  ComboBox
+        # changes are requests, never command-routing authority.
+        self.runtime_tool_type = None
+        self.runtime_tool_generation = None
+        self.runtime_fsm_class = None
+        self.runtime_preparation_state = 'UNKNOWN'
+        self.runtime_preparation_generation = None
 
         self.create_subscription(JointState, '/joint_states', self._joint_cb, 10)
         self.create_subscription(String, '/tool/status', self._tool_cb, 10)
@@ -100,6 +112,16 @@ class ManualGuiNode(Node):
         self.gripper = ActionClient(
             self, FollowJointTrajectory,
             '/gripper_controller/follow_joint_trajectory')
+
+    def destroy_node(self):
+        """Release the action waitable before its node/context disappears."""
+        client = getattr(self, 'gripper', None)
+        if client is not None:
+            try:
+                client.destroy()
+            finally:
+                self.gripper = None
+        super().destroy_node()
 
     def _joint_cb(self, msg):
         values = {}
@@ -217,16 +239,42 @@ class ManualGuiNode(Node):
         self.command_calibration(command)
         return True
 
-    def command_tool_fsm(self, command):
+    def command_tool_fsm(self, command, **values):
         if self.read_only:
             self.signals.log.emit('FSM command blocked: GUI is read-only')
             return False
-        if (self.selected_tool not in (
+        tool = self.runtime_tool_type if self.control_scope == 'END_EFFECTOR_ONLY' \
+            else self.selected_tool
+        if (tool not in (
                     'spur_1motor_gripper', 'dual_motor_gripper', 'cleaner')
                 or self.control_scope not in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')):
             return False
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            expected = {
+                'dual_motor_gripper': 'DualMotorGripperFSM',
+                'spur_1motor_gripper': 'SingleMotorGripperFSM',
+                'cleaner': 'CleanerFSM'}[tool]
+            profile_ids = [int(i) for i in self.tool_profile.get('actuator_ids', [])]
+            if (self.runtime_tool_generation is None
+                    or self.selected_tool != tool
+                    or self.runtime_fsm_class != expected
+                    or not profile_ids or self.actuator_ids != profile_ids):
+                self.signals.log.emit(
+                    'FSM command blocked: reported runtime tool context is incomplete')
+                return False
+            supported = ({
+                'dual_motor_gripper': {'OPEN', 'CLOSE', 'STOP', 'DISABLE', 'HOLD',
+                                       'JOG_OPEN', 'JOG_CLOSE', 'JOG_RELATIVE'},
+                'spur_1motor_gripper': {'OPEN', 'CLOSE', 'STOP', 'DISABLE', 'HOLD'},
+                'cleaner': {'LEFT', 'RIGHT', 'STOP'},
+            })[tool]
+            if str(command).upper() not in supported:
+                self.signals.log.emit(
+                    f'FSM command blocked: {command!r} is unsupported by {tool}')
+                return False
         self.fsm_command_pub.publish(String(data=json.dumps({
-            'tool_type': self.selected_tool, 'command': str(command).upper()})))
+            'tool_type': tool, 'command': str(command).upper(),
+            **values, **self._runtime_request_context()})))
         return True
 
     def request_tool_change(self, tool_type):
@@ -243,7 +291,7 @@ class ManualGuiNode(Node):
             return False
         return self.command_tool_fsm(command)
 
-    def command_calibration(self, command, **values):
+    def command_calibration(self, command, *, expected_context=None, **values):
         if self.read_only:
             self.signals.log.emit('Calibration command blocked: GUI is read-only')
             return False
@@ -252,13 +300,33 @@ class ManualGuiNode(Node):
                     self.control_scope == 'FULL_ROBOT'
                     and command in ('manual_enable', 'manual_disable')))):
             return False
-        payload = {'command': command, **values}
+        if (self.control_scope == 'END_EFFECTOR_ONLY'
+                and (self.runtime_tool_type != 'spur_1motor_gripper'
+                     or self.runtime_tool_generation is None
+                     or self.runtime_fsm_class != 'SingleMotorGripperFSM'
+                     or self.actuator_ids != [int(i) for i in
+                                              self.tool_profile.get('actuator_ids', [])])):
+            self.signals.log.emit(
+                'Calibration command blocked: runtime tool context is stale')
+            return False
+        if (expected_context is not None
+                and tuple(expected_context) != (
+                    self.runtime_tool_type, self.runtime_fsm_class,
+                    tuple(self.actuator_ids), self.runtime_tool_generation)):
+            self.signals.log.emit(
+                'Calibration command blocked: callback belongs to an old generation')
+            return False
+        payload = {'command': command, **values, **self._runtime_request_context()}
         self.calibration_command_pub.publish(String(data=json.dumps(payload)))
         return True
 
     def set_dual_motor_enabled(self, enabled, actuator_ids):
         """Explicit GUI-only dual torque request; never sent at startup."""
         ids = [int(item) for item in actuator_ids]
+        self.get_logger().info(
+            f'SET DUAL MOTOR enabled={enabled} ids={ids} '
+            f'selected_tool={self.selected_tool} scope={self.control_scope} '
+            f'read_only={self.read_only}')
         if self.read_only:
             self.signals.log.emit('Dual torque request blocked: GUI is read-only')
             return False
@@ -267,10 +335,105 @@ class ManualGuiNode(Node):
                 or ids != [3, 4]):
             self.signals.log.emit('Dual torque request blocked: expected IDs [3, 4]')
             return False
+        if (self.control_scope == 'END_EFFECTOR_ONLY'
+                and (self.runtime_tool_type != 'dual_motor_gripper'
+                     or self.runtime_tool_generation is None
+                     or self.runtime_fsm_class != 'DualMotorGripperFSM'
+                     or self.actuator_ids != ids
+                     or [int(i) for i in self.tool_profile.get('actuator_ids', [])]
+                     != ids)):
+            self.signals.log.emit(
+                'Dual torque request blocked: runtime profile/generation mismatch')
+            return False
         message = Int32MultiArray()
         message.data = [1 if enabled else 0, *ids]
+        self._tag_torque_context(message)
+        self.get_logger().info(
+            f'DUAL TORQUE PUBLISH {list(message.data)} '
+            f'subscribers={self.torque_pub.get_subscription_count()}')
         self.torque_pub.publish(message)
         return True
+
+    def set_current_tool_enabled(self, enabled):
+        """Route the shared Enable button through the active tool's existing path."""
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            tool = self.runtime_tool_type
+            if (tool not in ('dual_motor_gripper', 'spur_1motor_gripper', 'cleaner')
+                    or self.runtime_tool_generation is None
+                    or self.selected_tool != tool
+                    or (enabled and (
+                        self.runtime_preparation_state != 'READY'
+                        or self.runtime_preparation_generation
+                        != self.runtime_tool_generation))
+                    or self.runtime_fsm_class != {
+                        'dual_motor_gripper': 'DualMotorGripperFSM',
+                        'spur_1motor_gripper': 'SingleMotorGripperFSM',
+                        'cleaner': 'CleanerFSM'}[tool]
+                    or not self.actuator_ids
+                    or self.actuator_ids != [int(i) for i in
+                                             self.tool_profile.get('actuator_ids', [])]):
+                self.signals.log.emit(
+                    'Torque request blocked: no confirmed runtime tool context')
+                return False
+        else:
+            tool = self.selected_tool
+        self.get_logger().info(
+            f'SET CURRENT TOOL enabled={enabled} '
+            f'CURRENT TOOL={tool} FSM={self.runtime_fsm_class} '
+            f'IDS={self.actuator_ids} generation={self.runtime_tool_generation}')
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            if tool == 'dual_motor_gripper':
+                return self.set_dual_motor_enabled(enabled, self.actuator_ids)
+            if tool in ('spur_1motor_gripper', 'cleaner'):
+                return self._publish_current_tool_torque(enabled)
+            return False
+        if tool == 'dual_motor_gripper':
+            return self.set_dual_motor_enabled(enabled, [3, 4])
+        if tool == 'spur_1motor_gripper':
+            return self.command_calibration(
+                'manual_enable' if enabled else 'manual_disable')
+        if tool == 'cleaner':
+            if self.read_only:
+                self.signals.log.emit('Cleaner torque request blocked: GUI is read-only')
+                return False
+            ids = [int(item) for item in (
+                self.actuator_ids or self.tool_profile.get('actuator_ids', []))]
+            if not ids:
+                self.signals.log.emit('Cleaner torque request blocked: no active actuator')
+                return False
+            message = Int32MultiArray()
+            message.data = [1 if enabled else 0, *ids]
+            self.torque_pub.publish(message)
+            return True
+        return False
+
+    def _publish_current_tool_torque(self, enabled):
+        ids = [int(item) for item in self.actuator_ids]
+        if self.read_only or not ids or ids != self.tool_profile.get('actuator_ids'):
+            self.signals.log.emit('Torque request blocked: invalid active tool context')
+            return False
+        message = Int32MultiArray(data=[1 if enabled else 0, *ids])
+        self._tag_torque_context(message)
+        self.get_logger().info(
+            f'{self.selected_tool} TORQUE PUBLISH {list(message.data)} '
+            f'subscribers={self.torque_pub.get_subscription_count()}')
+        self.torque_pub.publish(message)
+        return True
+
+    def _runtime_request_context(self):
+        generation = self.runtime_tool_generation
+        if (self.control_scope != 'END_EFFECTOR_ONLY' or generation is None
+                or self.runtime_tool_type is None):
+            return {}
+        return {'tool_type': self.runtime_tool_type,
+                'tool_context_generation': generation}
+
+    def _tag_torque_context(self, message):
+        context = self._runtime_request_context()
+        if context:
+            message.layout.dim = [MultiArrayDimension(
+                label=f'tool_context:{context["tool_context_generation"]}',
+                size=len(message.data), stride=len(message.data))]
 
     def manual_dual_recovery_jog(self, actuator_id, delta_deg):
         """One explicit GUI click; bridge re-reads actual state before writing."""
@@ -285,7 +448,8 @@ class ManualGuiNode(Node):
             self.signals.log.emit('Manual recovery jog blocked by GUI safety gate')
             return False
         self.manual_recovery_pub.publish(String(data=json.dumps({
-            'actuator_id': int(actuator_id), 'delta_deg': float(delta_deg)})))
+            'actuator_id': int(actuator_id), 'delta_deg': float(delta_deg),
+            **self._runtime_request_context()})))
         return True
 
     def command_dual_calibration(self, command, **values):
@@ -298,7 +462,7 @@ class ManualGuiNode(Node):
                 or self.control_mode != 'MANUAL'):
             self.signals.log.emit('Dual calibration command blocked by GUI safety gate')
             return False
-        payload = {'command': str(command), **values}
+        payload = {'command': str(command), **values, **self._runtime_request_context()}
         self.dual_calibration_pub.publish(String(data=json.dumps(payload)))
         return True
 
@@ -367,13 +531,19 @@ class ManualGuiNode(Node):
     def command_cleaner(self, enabled):
         if self.read_only or self.selected_tool != 'cleaner':
             return False
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            if enabled:
+                self.signals.log.emit(
+                    'Cleaner enable blocked: choose LEFT/RIGHT through CleanerFSM')
+                return False
+            return self.command_tool_fsm('STOP')
         if self.control_mode != 'MANUAL' and not self.developer_direct_mode:
             self.signals.log.emit('Cleaner command blocked: ownership is not MANUAL')
             return
         self.cleaner_pub.publish(Bool(data=bool(enabled)))
 
     def command_cleaner_direction(self, command):
-        """Low-latency cleaner direction path, separate from the FSM queue."""
+        """Compatibility entry point; END_EFFECTOR_ONLY uses CleanerFSM."""
         if self.read_only or self.selected_tool != 'cleaner':
             return False
         command = str(command).strip().upper()
@@ -382,7 +552,11 @@ class ManualGuiNode(Node):
         if self.control_mode != 'MANUAL' and not self.developer_direct_mode:
             self.signals.log.emit('Cleaner direction blocked: ownership is not MANUAL')
             return False
-        self.cleaner_direction_pub.publish(String(data=command))
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            return self.command_tool_fsm(command)
+        context = self._runtime_request_context()
+        data = json.dumps({'command': command, **context}) if context else command
+        self.cleaner_direction_pub.publish(String(data=data))
         return True
 
     def emergency_stop(self):

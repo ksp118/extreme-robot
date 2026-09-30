@@ -132,7 +132,7 @@ def _window(scope):
         request_mode=lambda _mode: None, jog_arm=lambda *_args: None,
         command_arm=lambda *_args: None,
         command_gripper=lambda position: (goals.append(position) or True),
-        command_tool_fsm=lambda command: (goals.append(command) or True),
+        command_tool_fsm=lambda command, **_values: (goals.append(command) or True),
         stop_gripper=lambda: None, command_cleaner=lambda *_args: None,
         emergency_stop=lambda: None, tool_detached=lambda: None,
         set_dual_motor_enabled=lambda *_args: True,
@@ -152,8 +152,16 @@ def _window(scope):
 def _ready_status(scope):
     return {
         'control_scope': scope, 'tool_type': 'dual_motor_gripper',
+        'tool_context_generation': 0,
+        'tool_profile': {'actuator_ids': [3, 4], 'backend': 'gripper',
+                         'calibrated': True},
         'profile_valid': True, 'calibrated': True,
         'actuators_discovered': True, 'motion_allowed': True,
+        'tool_enable_allowed': True, 'tool_preparation_state': 'READY',
+        'tool_preparation_error': '', 'tool_enable_reason': '',
+        'tool_torque_state': 'ON',
+        'control_mode': 'MANUAL',
+        'fsm_class': 'DualMotorGripperFSM',
         'read_only': False, 'emergency_stop': False, 'tool_detached': False,
         'bridge_connected': True,
         'fsm_state': 'READY',
@@ -352,15 +360,19 @@ def test_mock_runtime_round_trip_routes_buttons_keys_and_clears_context():
     window.mock_mode = True
     window.node.temporary_jog_mode = False
     window.node.command_cleaner = lambda enabled: commands.append(('cleaner', enabled))
+    window.node.command_cleaner_direction = (
+        lambda direction: (commands.append(direction) or True)
+    )
     window.node.command_calibration = lambda command, **values: (commands.append((command, values)) or True)
     requests = []
     window.node.request_tool_change = lambda tool: (requests.append(tool) or True)
     dual_profile = dict(window.profile)
     window._update_mode('MANUAL')
     try:
-        for tool, ids in [('dual_motor_gripper', [3, 4]),
-                          ('spur_1motor_gripper', [5]),
-                          ('cleaner', [6]), ('dual_motor_gripper', [3, 4])]:
+        for generation, (tool, ids) in enumerate([
+                ('dual_motor_gripper', [3, 4]),
+                ('spur_1motor_gripper', [5]),
+                ('cleaner', [6]), ('dual_motor_gripper', [3, 4])]):
             old_panel = window.tool_control_box
             changed = window.node.selected_tool != tool
             if changed:
@@ -371,8 +383,13 @@ def test_mock_runtime_round_trip_routes_buttons_keys_and_clears_context():
                 assert window.pending_tool_change == tool
                 assert not window.tool_control_box.isEnabled()
             status = _ready_status('END_EFFECTOR_ONLY')
-            status.update(tool_type=tool, online=True, hardware_error=0,
-                          tool_torque_state='ON', calibration_jog_enabled=True,
+            status.update(tool_type=tool, tool_context_generation=generation,
+                          online=True, hardware_error=0,
+                          fsm_class={
+                              'dual_motor_gripper': 'DualMotorGripperFSM',
+                              'spur_1motor_gripper': 'SingleMotorGripperFSM',
+                              'cleaner': 'CleanerFSM'}[tool],
+                          tool_torque_state='OFF', calibration_jog_enabled=True,
                           calibration={'active': True, 'enabled': True},
                           dual_calibration={'state': 'READY', 'active': False})
             profile = dual_profile if len(ids) == 2 else {
@@ -383,12 +400,16 @@ def test_mock_runtime_round_trip_routes_buttons_keys_and_clears_context():
             if ids != [3, 4]:
                 status['actuators'] = [dict(id=i, position=3300, online=True) for i in ids]
             for sample in status['actuators']:
-                sample.update(torque_state='ON', hardware_error=0)
+                sample.update(torque_state='OFF', hardware_error=0)
             window._update_tool_status(status)
             assert window.node.selected_tool == tool
             assert window.node.actuator_ids == ids
             assert window.profile is profile
             assert window.pending_tool_change is None
+            status['tool_torque_state'] = 'ON'
+            for sample in status['actuators']:
+                sample['torque_state'] = 'ON'
+            window._update_tool_status(status)
             if changed:
                 assert old_panel.isHidden() and not old_panel.isEnabled()
                 assert not window.gripper_target_ticks
@@ -398,13 +419,14 @@ def test_mock_runtime_round_trip_routes_buttons_keys_and_clears_context():
             commands.clear()
             if tool == 'cleaner':
                 assert not window.open_button.isHidden()
-                assert window.spur_enable.isHidden()
-                assert window.dual_enable.isHidden()
+                assert window.spur_enable is window.common_enable
+                assert not window.common_enable.isHidden()
+                assert window.dual_enable is window.common_enable
                 window.close_button.click()
                 window.open_button.click()
                 window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier))
                 window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Left, Qt.NoModifier))
-                assert commands == ['LEFT', 'RIGHT', ('cleaner', False)]
+                assert commands == ['LEFT', 'RIGHT', 'STOP', 'LEFT']
                 assert window.spur_actual_state is None
                 assert window.motor_minus_half is None
             else:
@@ -425,9 +447,16 @@ def test_mock_runtime_round_trip_routes_buttons_keys_and_clears_context():
                     window.jog_close.click()
                     window.jog_open.click()
                     window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Left, Qt.NoModifier))
-                    assert commands == [('manual_open', {}), ('manual_hold', {}),
-                                        ('manual_close', {}), ('manual_hold', {}),
-                                        ('manual_step', {'delta_deg': -0.5})]
+                    expected_context = (
+                        'spur_1motor_gripper', 'SingleMotorGripperFSM',
+                        (5,), generation)
+                    assert commands == [
+                        ('manual_open', {'expected_context': expected_context}),
+                        ('manual_hold', {'expected_context': expected_context}),
+                        ('manual_close', {'expected_context': expected_context}),
+                        ('manual_hold', {'expected_context': expected_context}),
+                        ('manual_step', {'delta_deg': -0.5,
+                                         'expected_context': expected_context})]
                     assert not window.gripper_target_ticks
             app.processEvents()
         assert requests == ['spur_1motor_gripper', 'cleaner', 'dual_motor_gripper']
@@ -559,8 +588,12 @@ def test_spur_enable_uses_current_context_before_motion_allowed():
         window.control_mode = window.node.control_mode = 'FSM'
         window.pending_tool_change = 'spur_1motor_gripper'
         status = _ready_status('END_EFFECTOR_ONLY')
-        status.update(tool_type='spur_1motor_gripper', control_mode='MANUAL',
-                      motion_allowed=False, calibration={'active': False, 'enabled': False},
+        status.update(tool_type='spur_1motor_gripper',
+                      fsm_class='SingleMotorGripperFSM',
+                      tool_context_generation=1, control_mode='MANUAL',
+                      motion_allowed=False, tool_enable_allowed=True,
+                      tool_torque_state='OFF', tool_preparation_state='READY',
+                      calibration={'active': False, 'enabled': False},
                       tool_profile={'actuator_ids': [5], 'calibrated': True,
                                     'open_tick': 2945, 'close_tick': 3752,
                                     'safe_min_tick': 2945, 'safe_max_tick': 3752},
@@ -579,9 +612,13 @@ def test_spur_enable_uses_current_context_before_motion_allowed():
         assert commands == ['manual_enable']
         status['fsm_state'] = 'READY'
         status['actuators'][0]['torque_state'] = 'ON'
-        # Deliberately leave motion_allowed false: torque readback is authoritative.
+        status['tool_torque_state'] = 'ON'
+        # Torque readback alone must not bypass the bridge motion gate.
         window._update_tool_status(status)
         assert not window.common_enable.isEnabled()
+        assert not window.open_button.isEnabled()
+        status['motion_allowed'] = True
+        window._update_tool_status(status)
         assert all(w.isEnabled() for w in (window.open_button, window.close_button,
                                           window.hold_open_button, window.hold_close_button))
         window.open_button.click()

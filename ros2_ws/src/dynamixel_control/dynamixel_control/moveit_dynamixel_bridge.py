@@ -14,7 +14,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rcl_interfaces.msg import SetParametersResult
 from trajectory_msgs.msg import JointTrajectory
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Int32MultiArray, String
+from std_msgs.msg import Bool, Int32MultiArray, MultiArrayDimension, String
 from control_msgs.action import FollowJointTrajectory
 from robot_arm_msgs.action import ArmRecordedPath, ArmTestMove, EndEffectorRotate
 from dynamixel_sdk import PortHandler, PacketHandler, GroupSyncWrite, GroupSyncRead
@@ -396,6 +396,7 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("calibration_jog_mode", False)
         self.declare_parameter("calibration_max_jog_ticks", 12)
         self.declare_parameter("gripper_target_tolerance_ticks", 20)
+        self.declare_parameter("auto_enable_on_attach", False)
         default_profiles = str(Path(get_package_share_directory(
             'dynamixel_control')) / 'config' / 'tool_profiles.yaml')
         self.declare_parameter("tool_profile_file", default_profiles)
@@ -466,6 +467,16 @@ class MoveItDynamixelBridge(Node):
         self._tool_change_lock = threading.Lock()
         self._tool_change_pending = None
         self._tool_change_error = ''
+        self._tool_preparation_state = 'IDLE'
+        self._tool_preparation_error = ''
+        self._tool_context_generation = 0
+        self._tool_prepared_generation = None
+        self._runtime_switching = False
+        # The detector runs in a callback group that may be reentrant on a
+        # multi-threaded executor.  It owns policy/context work, never the
+        # serial bus lock (each probe/read owns that only for its transaction).
+        self._auto_detection_in_progress = False
+        self._auto_detection_lock = threading.Lock()
         self._physical_tool_detached = False
         self._tool_detection_observation = None
         self._tool_detection_count = 0
@@ -511,6 +522,10 @@ class MoveItDynamixelBridge(Node):
             self.get_parameter("gripper_target_tolerance_ticks").value)
         if self.gripper_target_tolerance < 0:
             raise ValueError('gripper_target_tolerance_ticks must be non-negative')
+        self.auto_enable_on_attach = bool(
+            self.get_parameter("auto_enable_on_attach").value)
+
+        self._contact_grasp_event = None
         try:
             profiles = load_profiles(
                 self.get_parameter('tool_profile_file').value)
@@ -639,7 +654,8 @@ class MoveItDynamixelBridge(Node):
                     if self._enable_torque(config["id"], joint_name):
                         self.group_sync_read.addParam(config["id"])
                         self.active_ids.add(config["id"])
-            if self.cleaning_configured:
+            if (self.cleaning_configured
+                    and self.control_scope != 'END_EFFECTOR_ONLY'):
                 self._configure_cleaning_actuator()
 
         self.tool_ids = list(self.tool_profile.get('actuator_ids', []))
@@ -657,27 +673,43 @@ class MoveItDynamixelBridge(Node):
                 self._tool_samples[dxl_id] = {
                     'id': dxl_id, 'joint': joint_names[0],
                     'position': seed_tick, 'effort': 0.0, 'online': True,
-                    'hardware_error': 0, 'torque_state': 'OFF'}
+                    'hardware_error': 0, 'torque_state': 'OFF',
+                    'model': 1060,
+                    'operating_mode': self._required_tool_modes(self.tool_profile).get(dxl_id),
+                    'profile_velocity': self.tool_profile.get('profile_velocity'),
+                    'profile_acceleration': self.tool_profile.get('profile_acceleration')}
         if not self.mock_mode and self.port_connected:
             self.tool_discovered = self._discover_tool_ids()
             if self.read_only:
                 for dxl_id in self.tool_ids:
                     self.group_sync_read.addParam(dxl_id)
                     self.active_ids.add(dxl_id)
-            elif self.tool_type == 'spur_1motor_gripper' and self.tool_ids == [5]:
-                # A spur startup is observation-only.  It must never rewrite
-                # torque, operating mode, profile, or a goal before an
-                # operator explicitly uses the calibration/FSM controls.
-                self.group_sync_read.addParam(5)
-                self.active_ids.add(5)
-            elif self.tool_type == 'dual_motor_gripper' and self.tool_ids == [3, 4]:
-                # Preserve the dual FollowJointTrajectory architecture while
-                # making startup observation-only.  Torque/mode/profile writes
-                # are an explicit operator action, never a GUI launch side
-                # effect.
-                for dxl_id in self.tool_ids:
-                    self.group_sync_read.addParam(dxl_id)
-                    self.active_ids.add(dxl_id)
+            elif (self.control_scope == 'END_EFFECTOR_ONLY'
+                    and self.tool_type in (
+                        'dual_motor_gripper', 'spur_1motor_gripper', 'cleaner')
+                    and not self.calibration_jog_enabled
+                    and not self.temporary_jog_enabled):
+                # Initial selection and hot-swap share one validated runtime
+                # preparation path: verify the physical profile, configure
+                # only with torque OFF, and read back state. No tool is
+                # torque-enabled as a startup side effect.
+                samples = {}
+                try:
+                    samples = self._verify_requested_tool_profile(
+                        self.tool_type, self.tool_profile, configure=True)
+                    samples = self._runtime_configure_selected_tool(
+                        self.tool_type, self.tool_profile, samples)
+                    self._tool_samples.update(samples)
+                    for dxl_id in self.tool_ids:
+                        self.group_sync_read.addParam(dxl_id)
+                        self.active_ids.add(dxl_id)
+                except Exception as exc:
+                    self.tool_motion_allowed = False
+                    self._tool_preparation_state = 'FAILED'
+                    self._tool_preparation_error = str(exc)
+                    self._tool_samples.update(samples)
+                    self.get_logger().error(
+                        f'{self.tool_type} Torque-OFF preparation failed: {exc}')
             elif self.calibration_jog_enabled:
                 # Calibration observes the pre-existing hardware state first.
                 # In particular, do not disable torque or rewrite mode/profile.
@@ -706,7 +738,8 @@ class MoveItDynamixelBridge(Node):
             # unavailable, rather than substituting torque ownership cache.
             snapshot = getattr(self.tool_fsm, 'snapshot', None)
             if self.tool_type == 'spur_1motor_gripper' and isinstance(snapshot, dict):
-                self._tool_samples[5] = {
+                sample = dict(self._tool_samples.get(5, {}))
+                sample.update({
                     'id': 5,
                     'joint': (self.tool_profile.get('joint_names') or [''])[0],
                     'position': snapshot.get('position'),
@@ -715,7 +748,8 @@ class MoveItDynamixelBridge(Node):
                     'torque_state': ('ON' if snapshot.get('torque') == 1 else 'OFF'),
                     'hardware_error': snapshot.get('hardware_error'),
                     'model': snapshot.get('model'),
-                }
+                })
+                self._tool_samples[5] = sample
             if self.tool_type == 'spur_1motor_gripper':
                 self.calibration_session = CalibrationSession(
                     self, self.tool_profile)
@@ -726,7 +760,23 @@ class MoveItDynamixelBridge(Node):
 
         if self.tool_type == 'cleaner':
             self.tool_fsm = CleanerFSM(self.tool_profile, self)
-            self.tool_fsm.startup()
+            state = self.tool_fsm.startup()
+            if state == ToolState.FAULT:
+                self._tool_preparation_state = 'FAILED'
+                self._tool_preparation_error = (
+                    self.tool_fsm.fault_reason or 'CleanerFSM startup failed')
+
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            if self._tool_preparation_state != 'FAILED':
+                reason = self._tool_enable_block_reason()
+                if not reason and self._current_tool_torque_state() != 'OFF':
+                    reason = ('도구 시작 준비에서 Torque OFF를 확인하지 못했습니다: '
+                              f'{self._current_tool_torque_state()}')
+                self._tool_preparation_state = 'READY' if not reason else 'FAILED'
+                self._tool_preparation_error = reason or ''
+            self._tool_prepared_generation = (
+                self._tool_context_generation
+                if self._tool_preparation_state == 'READY' else None)
 
         self.spur_manual_control = SpurManualControl(self)
         self.create_timer(0.1, self._spur_manual_watchdog)
@@ -902,13 +952,16 @@ class MoveItDynamixelBridge(Node):
             0.5, self._publish_tool_status_safely,
             callback_group=ReentrantCallbackGroup())
         self._bus_tool_identity = None
+        if self.control_scope == 'END_EFFECTOR_ONLY' and not self.tool_discovered:
+            self._physical_tool_detached = True
         if self.auto_tool_detection and not self.mock_mode and self.port_connected:
             self._bus_tool_identity = BusToolIdentityProvider(
                 self._tool_profiles, self._probe_tool_id,
                 excluded_ids={config['id'] for config in JOINT_CONFIG.values()})
             self.create_timer(
                 self.tool_detection_period_s, self._poll_physical_tool,
-                callback_group=MutuallyExclusiveCallbackGroup())
+                callback_group=(self._command_group if self.gripper_only_mode
+                                else MutuallyExclusiveCallbackGroup()))
 
         self.get_logger().info(
             f"MoveIt Dynamixel bridge started (arm={list(JOINT_CONFIG)}, "
@@ -1003,6 +1056,9 @@ class MoveItDynamixelBridge(Node):
         먼저 나가버린다(안전 게이트에 부가 동작을 넣지 않는다는 이 저장소의 원칙).
         """
         data = list(msg.data)
+        self.get_logger().info(
+            f'TORQUE REQUEST RECEIVED {data} tool={self.tool_type} '
+            f'ids={self.tool_ids} scope={self.control_scope}')
         if not data:
             self.get_logger().error("torque_request: [enable, id...] 형식이어야 합니다")
             return
@@ -1010,24 +1066,67 @@ class MoveItDynamixelBridge(Node):
             self.get_logger().warn("torque_request 무시 — read_only 모드는 레지스터를 쓰지 않습니다")
             return
 
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            expected_tag = f'tool_context:{self._tool_context_generation}'
+            tags = [dimension.label for dimension in msg.layout.dim]
+            if expected_tag not in tags:
+                self.get_logger().warn(
+                    'Ignoring torque request without current runtime context tag')
+                return
+            for dimension in msg.layout.dim:
+                if (dimension.label.startswith('tool_context:')
+                        and dimension.label != f'tool_context:{self._tool_context_generation}'):
+                    self.get_logger().warn('Ignoring torque from a replaced tool context')
+                    return
+            self._end_effector_torque_request(data)
+            return
+
         enable = 1 if data[0] else 0
         ids = data[1:] or sorted(self.active_ids)
+
+        # END_EFFECTOR_ONLY recovery:
+        # STOP/DISABLE leaves the tool FSM in STOPPED.  A later explicit
+        # ENABLE must re-run the existing startup validation before torque is
+        # applied; merely turning torque back on would otherwise leave
+        # OPEN/CLOSE unavailable forever.
+        if (
+            enable
+            and self.control_scope == 'END_EFFECTOR_ONLY'
+            and self.tool_fsm is not None
+            and self.tool_fsm.state == ToolState.STOPPED
+            and not self.emergency_stop_active
+            and not self.tool_detached
+        ):
+            state = self.tool_fsm.startup()
+            if state != ToolState.READY:
+                self.get_logger().warn(
+                    f'torque enable rejected: tool FSM recovery failed '
+                    f'({state.name})')
+                return
+            self.get_logger().info(
+                f'tool FSM recovered STOPPED -> READY before enable: '
+                f'{self.tool_type}')
+
         if enable and (self.emergency_stop_active or self.tool_detached):
             self.get_logger().warn(
                 'torque enable rejected: emergency stop or tool-detached latch is active')
             return
-        if enable and self.tool_type == 'dual_motor_gripper':
-            samples = [self._tool_samples.get(dxl_id, {}) for dxl_id in (3, 4)]
-            dual_enable_ready = (
-                ids == [3, 4] and self.control_scope in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')
+        if enable and self.tool_type in ('dual_motor_gripper', 'cleaner'):
+            samples = [self._tool_samples.get(dxl_id, {})
+                       for dxl_id in self.tool_ids]
+            tool_enable_ready = (
+                list(ids) == list(self.tool_ids)
+                and self.control_scope in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')
                 and self._tool_enable_allowed()
                 and all(sample.get('online')
                         and sample.get('hardware_error') == 0
-                        and sample.get('position') is not None
+                        and (self.tool_type == 'cleaner'
+                             or sample.get('position') is not None)
                         for sample in samples))
-            if not dual_enable_ready:
+            if not tool_enable_ready:
                 self.get_logger().warn(
-                    'dual torque enable rejected: profile/scope/online/HW gate closed')
+                    f'{self.tool_type} torque enable rejected: '
+                    'profile/scope/online/HW gate closed')
                 return
         if self.mock_mode:
             # Mock must exercise the same explicit-enable state machine, while
@@ -1052,7 +1151,11 @@ class MoveItDynamixelBridge(Node):
                 continue
             if enable:
                 try:
-                    self._prepare_dual_gripper_enable(dxl_id)
+                    if self.tool_type == 'cleaner':
+                        if not self._enable_cleaner_torque(dxl_id):
+                            raise RuntimeError('cleaner torque enable helper rejected')
+                    else:
+                        self._prepare_dual_gripper_enable(dxl_id)
                 except RuntimeError as exc:
                     self.get_logger().error(
                         f'ID {dxl_id} torque enable rejected: {exc}')
@@ -1062,16 +1165,17 @@ class MoveItDynamixelBridge(Node):
                 # 토크가 꺼진 동안 팔은 중력으로 처지는데 Goal 레지스터에는 마지막
                 # 명령값이 그대로 남아 있다 — 그냥 켜면 서보가 그 옛 목표로 **튄다**
                 # (teleop_core 의 resume 이 _sync_goal_to_measured 를 하는 것과 같은 이유).
-                pos, res, err = self.packet_handler.read4ByteTxRx(
-                    self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
-                if res == 0 and err == 0:
-                    self.packet_handler.write4ByteTxRx(
-                        self.port_handler, dxl_id, ADDR_GOAL_POSITION, pos)
-                else:
-                    self.get_logger().error(
-                        f"ID {dxl_id} 현재 위치를 못 읽어 토크 인가를 거부합니다")
-                    failed.append(dxl_id)
-                    continue
+                if self.tool_type != 'cleaner':
+                    pos, res, err = self.packet_handler.read4ByteTxRx(
+                        self.port_handler, dxl_id, ADDR_PRESENT_POSITION)
+                    if res == 0 and err == 0:
+                        self.packet_handler.write4ByteTxRx(
+                            self.port_handler, dxl_id, ADDR_GOAL_POSITION, pos)
+                    else:
+                        self.get_logger().error(
+                            f"ID {dxl_id} 현재 위치를 못 읽어 토크 인가를 거부합니다")
+                        failed.append(dxl_id)
+                        continue
             result, error = self.packet_handler.write1ByteTxRx(
                 self.port_handler, dxl_id, ADDR_TORQUE_ENABLE,
                 TORQUE_ENABLE if enable else TORQUE_DISABLE)
@@ -1096,6 +1200,92 @@ class MoveItDynamixelBridge(Node):
                         self.port_handler, dxl_id, ADDR_TORQUE_ENABLE,
                         TORQUE_DISABLE)
                     self.torque_enabled_ids.discard(dxl_id)
+
+    def _readback_tool_torque(self):
+        observed = {}
+        for dxl_id in self.tool_ids:
+            sample = self._tool_samples.setdefault(dxl_id, {'id': dxl_id})
+            try:
+                if self.mock_mode:
+                    actual = {'ON': 1, 'OFF': 0}.get(sample.get('torque_state'))
+                else:
+                    actual = self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1, 'tool torque readback')
+                sample['torque_state'] = {1: 'ON', 0: 'OFF'}.get(actual, 'UNKNOWN')
+            except Exception as exc:
+                sample['torque_state'] = 'UNKNOWN'
+                self.get_logger().error(f'ID{dxl_id} torque readback failed: {exc}')
+            observed[dxl_id] = sample['torque_state']
+            if sample['torque_state'] == 'ON':
+                self.torque_enabled_ids.add(dxl_id)
+            else:
+                self.torque_enabled_ids.discard(dxl_id)
+            self.get_logger().info(
+                f'TORQUE READBACK ID{dxl_id}={sample["torque_state"]}')
+        return observed
+
+    def _end_effector_torque_request(self, data):
+        """Use each existing tool helper in one bus-serialized enable transaction."""
+        if self._runtime_switching:
+            self.get_logger().warn(
+                'Torque request rejected while runtime tool context is switching')
+            return
+        if data[0] not in (0, 1) or data[1:] != self.tool_ids or not self.tool_ids:
+            self.get_logger().warn('Torque request rejected: IDs differ from active tool')
+            return
+        if (data[0] and (self._tool_preparation_state != 'READY'
+                         or self._tool_prepared_generation
+                         != self._tool_context_generation)):
+            self.get_logger().warn(
+                'Torque enable rejected: runtime preparation belongs to another generation')
+            return
+        with self._bus_lock:
+            if not data[0]:
+                self._stop_tool('explicit GUI torque disable')
+                return
+            try:
+                if (self.emergency_stop_active or self.tool_detached
+                        or self._physical_tool_detached):
+                    raise RuntimeError('emergency stop or detached latch is active')
+                if not self.mock_mode:
+                    self._tool_samples = self._verify_requested_tool_profile(
+                        self.tool_type, self.tool_profile)
+                if not self._tool_enable_allowed():
+                    raise RuntimeError('profile/online/HW/synchronization/calibration gate closed')
+                # STOPPED never grants motion by itself. Re-run the same
+                # read-only startup used by the fixed-tool launch.
+                self.tool_motion_allowed = bool(self.tool_selection.valid)
+                self.tool_fsm.startup()
+                if self.tool_fsm.state.name != 'READY':
+                    raise RuntimeError(f'FSM startup returned {self.tool_fsm.state.name}')
+                for dxl_id in self.tool_ids:
+                    if self._tool_samples[dxl_id]['torque_state'] == 'ON':
+                        continue
+                    if self.mock_mode:
+                        self._tool_samples[dxl_id]['torque_state'] = 'ON'
+                    elif self.tool_type == 'cleaner':
+                        if not self._enable_cleaner_torque(dxl_id):
+                            raise RuntimeError('cleaner torque helper rejected enable')
+                    else:
+                        if self.tool_type == 'dual_motor_gripper':
+                            self._prepare_dual_gripper_enable(dxl_id)
+                            current = self.read_position(dxl_id)
+                            self.goal_position(dxl_id, current)
+                            goal = self._read_register(
+                                dxl_id, ADDR_GOAL_POSITION, 4,
+                                'dual parked goal readback', signed=True)
+                            if goal != current:
+                                raise RuntimeError('dual current-position goal sync failed')
+                        self.set_torque(dxl_id, True)
+                states = self._readback_tool_torque()
+                if not all(state == 'ON' for state in states.values()):
+                    raise RuntimeError('torque enable readback failed')
+                self.get_logger().info(
+                    f'TOOL ENABLE READY tool={self.tool_type} ids={self.tool_ids} '
+                    f'fsm={type(self.tool_fsm).__name__}')
+            except Exception as exc:
+                self.get_logger().error(f'Torque enable rejected: {exc}')
+                self._stop_tool('failed enable rollback')
 
     def _prepare_dual_gripper_enable(self, dxl_id):
         """Apply only validated dual RAM profile on an explicit enable request.
@@ -1149,17 +1339,60 @@ class MoveItDynamixelBridge(Node):
     def fsm_command_callback(self, msg):
         """Route normal OPEN/CLOSE/STOP only to the selected tool FSM."""
         command = str(msg.data).strip().upper()
+        request = None
         if str(msg.data).lstrip().startswith('{'):
             try:
                 request = json.loads(msg.data)
-                if request['tool_type'] != self.tool_type:
+                if request['tool_type'] != self.tool_type or not self._tool_request_current(request):
                     self.get_logger().warn('Ignoring command from a replaced tool context')
                     return
                 command = str(request['command']).strip().upper()
             except (ValueError, KeyError, TypeError):
                 return
+        elif self.control_scope == 'END_EFFECTOR_ONLY':
+            self.get_logger().warn(
+                'Ignoring untagged command: END_EFFECTOR_ONLY requires tool/generation context')
+            return
+        expected_fsm = {
+            'dual_motor_gripper': 'DualMotorGripperFSM',
+            'spur_1motor_gripper': 'SingleMotorGripperFSM',
+            'cleaner': 'CleanerFSM'}
+        if (self.control_scope == 'END_EFFECTOR_ONLY'
+                and (self.tool_type not in expected_fsm
+                     or self.tool_fsm is None
+                     or type(self.tool_fsm).__name__ != expected_fsm[self.tool_type]
+                     or not self.tool_ids
+                     or self.tool_ids != [int(i) for i in
+                                          self.tool_profile.get('actuator_ids', [])])):
+            self.get_logger().error(
+                f'FSM command rejected: runtime context is inconsistent '
+                f'tool={self.tool_type} fsm={type(self.tool_fsm).__name__ if self.tool_fsm else None} '
+                f'ids={self.tool_ids}')
+            return
+        if (self.control_scope == 'END_EFFECTOR_ONLY'
+                and command not in ('STOP', 'DISABLE', 'HOLD')
+                and not self._tool_backend_ready()):
+            self.get_logger().warn('tool command rejected: runtime motion gate closed')
+            return
+        if command == 'JOG_RELATIVE':
+            try:
+                self._relative_dual_jog(
+                    int(request.get('direction', 0)),
+                    int(request.get('step_ticks', 0)))
+            except (TypeError, ValueError, RuntimeError) as exc:
+                self.get_logger().warn(f'relative dual jog rejected: {exc}')
+            return
         if self.tool_type == 'cleaner':
-            self._cleaner_direction_command(command)
+            try:
+                state = self.tool_fsm.command(command)
+                self.get_logger().info(
+                    f'COMMAND RESULT command={command} tool=cleaner '
+                    f'fsm=CleanerFSM ids={self.tool_ids} '
+                    f'state={getattr(state, "value", state)} accepted=true')
+            except Exception as exc:
+                self.get_logger().warn(
+                    f'COMMAND RESULT command={command} tool=cleaner '
+                    f'fsm=CleanerFSM ids={self.tool_ids} accepted=false reason={exc}')
             return
         if self.tool_fsm is None or self.tool_type not in (
                 'spur_1motor_gripper', 'dual_motor_gripper'):
@@ -1178,9 +1411,43 @@ class MoveItDynamixelBridge(Node):
         try:
             state = self.tool_fsm.command(command)
             self.get_logger().info(
-                f'{self.tool_type} FSM command {msg.data!r} -> {state.name}')
+                f'COMMAND RESULT command={command} tool={self.tool_type} '
+                f'fsm={type(self.tool_fsm).__name__} ids={self.tool_ids} '
+                f'state={state.name} accepted=true')
         except Exception as exc:  # command rejection makes no register write
-            self.get_logger().warn(f'tool FSM command rejected: {exc}')
+            self.get_logger().warn(
+                f'COMMAND RESULT command={command} tool={self.tool_type} '
+                f'fsm={type(self.tool_fsm).__name__} ids={self.tool_ids} '
+                f'accepted=false reason={exc}')
+
+    def _relative_dual_jog(self, direction, step_ticks):
+        """Dispatch one profile-bounded pair-relative bench jog."""
+        if direction not in (-1, 1) or not 1 <= step_ticks <= 64:
+            raise RuntimeError('relative dual jog direction/step is invalid')
+        if self.tool_type != 'dual_motor_gripper':
+            raise RuntimeError('relative jog requires the active dual profile')
+        endpoints = self.tool_profile.get('motor_endpoints') or {}
+        currents = {}
+        with self._bus_lock:
+            for dxl_id in self.tool_ids:
+                position, _effort = self._read_tool_state(dxl_id)
+                currents[dxl_id] = position
+        targets = {}
+        for dxl_id in self.tool_ids:
+            endpoint = endpoints.get(dxl_id, endpoints.get(str(dxl_id)))
+            if not endpoint:
+                raise RuntimeError(f'ID{dxl_id} endpoint profile unavailable')
+            sign_to_open = 1 if endpoint['open'] > endpoint['close'] else -1
+            raw = currents[dxl_id] + direction * sign_to_open * step_ticks
+            low, high = sorted((int(endpoint['open']), int(endpoint['close'])))
+            targets[dxl_id] = min(high, max(low, raw))
+        if targets == currents:
+            self.get_logger().info('relative dual jog no-op: requested endpoint reached')
+            return
+        self.get_logger().info(
+            f'relative dual jog: current={currents}, target={targets}, '
+            f'clamped_target={targets}, step_ticks={step_ticks}')
+        self._command_dual_targets_impl(targets)
 
     def manual_recovery_callback(self, msg):
         """Manual dual resync ingress; never participates in OPEN/CLOSE policy."""
@@ -1195,6 +1462,8 @@ class MoveItDynamixelBridge(Node):
             return
         try:
             request = json.loads(msg.data)
+            if not self._tool_request_current(request):
+                return
             target = self.dual_manual_recovery.jog(
                 request['actuator_id'], request['delta_deg'])
             self.get_logger().info(
@@ -1215,6 +1484,8 @@ class MoveItDynamixelBridge(Node):
             return
         try:
             request = json.loads(msg.data)
+            if not self._tool_request_current(request):
+                return
             command = str(request['command']).lower()
             if command == 'start':
                 session.start()
@@ -1275,6 +1546,8 @@ class MoveItDynamixelBridge(Node):
             return
         try:
             request = json.loads(msg.data)
+            if not self._tool_request_current(request):
+                return
             command = str(request['command']).lower()
             if command.startswith('manual_'):
                 with self._bus_lock:
@@ -1962,8 +2235,222 @@ class MoveItDynamixelBridge(Node):
             return False
         return True
 
+    def _verify_requested_tool_profile(self, requested, profile, configure=False):
+        """Read back the GUI-selected tool only; never auto-select another one."""
+        ids = [int(item) for item in profile.get('actuator_ids', [])]
+        required_modes = self._required_tool_modes(profile)
+        samples = {}
+        present_ids = []
+        with self._bus_lock:
+            for dxl_id in ids:
+                model, result, error = self.packet_handler.ping(
+                    self.port_handler, dxl_id)
+                if result != 0 or error != 0:
+                    raise ToolProfileError(
+                        f'{requested} expects actuator IDs {ids}; '
+                        f'ID {dxl_id} ping failed: result={result}, error={error}; '
+                        f'present IDs so far={present_ids}')
+                present_ids.append(dxl_id)
+                expected_models = profile.get('endpoint_calibration_models') or {}
+                expected_model = expected_models.get(
+                    dxl_id, expected_models.get(str(dxl_id), profile.get('motor_model')))
+                if (self.control_scope == 'END_EFFECTOR_ONLY'
+                        and expected_model is not None and int(model) != int(expected_model)):
+                    raise ToolProfileError(f'{requested} ID{dxl_id} model mismatch')
+                hw_error = self._read_register(
+                    dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                    f'{requested} hardware error')
+                if hw_error != 0:
+                    raise ToolProfileError(
+                        f'{requested} ID {dxl_id} hardware error=0x{hw_error:02X}')
+                mode = self._read_register(
+                    dxl_id, ADDR_OPERATING_MODE, 1,
+                    f'{requested} operating mode')
+                required_mode = required_modes.get(
+                    dxl_id, required_modes.get(str(dxl_id)))
+                if (required_mode is not None and mode != int(required_mode)
+                        and not (configure and not self.read_only
+                                 and self.control_scope == 'END_EFFECTOR_ONLY')):
+                    raise ToolProfileError(
+                        f'{requested} ID {dxl_id} operating mode {mode} '
+                        f'!= required {int(required_mode)}')
+                position = self._tool_position_tick(
+                    dxl_id,
+                    self._read_register(
+                        dxl_id, ADDR_PRESENT_POSITION, 4,
+                        f'{requested} present position'),
+                    profile=profile if self.control_scope == 'END_EFFECTOR_ONLY' else None)
+                sample = {
+                    'id': dxl_id,
+                    'joint': (profile.get('joint_names') or [''])[0],
+                    'model': int(model),
+                    'online': True,
+                    'operating_mode': int(mode),
+                    'hardware_error': int(hw_error),
+                    'position': int(position),
+                    'effort': 0.0,
+                    'torque_state': (
+                        'ON' if self._read_register(
+                            dxl_id, ADDR_TORQUE_ENABLE, 1,
+                            f'{requested} torque state') == TORQUE_ENABLE
+                        else 'OFF'),
+                    'profile_acceleration': self._read_register(
+                        dxl_id, ADDR_PROFILE_ACCELERATION, 4,
+                        f'{requested} profile acceleration'),
+                    'profile_velocity': self._read_register(
+                        dxl_id, ADDR_PROFILE_VELOCITY, 4,
+                        f'{requested} profile velocity'),
+                }
+                if profile.get('backend') == 'cleaner':
+                    sample['goal_velocity'] = self._read_register(
+                        dxl_id, ADDR_GOAL_VELOCITY, 4,
+                        f'{requested} goal velocity readback', signed=True)
+                samples[dxl_id] = sample
+        self.get_logger().info(
+            f'manual tool request verified: tool_type={requested}, '
+            f'present_ids={present_ids}')
+        return samples
+
+    def _required_tool_modes(self, profile):
+        ids = [int(item) for item in profile.get('actuator_ids', [])]
+        if profile.get('backend') == 'cleaner':
+            return {ids[0]: 1} if ids else {}
+        return profile.get('required_operating_modes') or {}
+
+    def _runtime_configure_selected_tool(self, requested, profile, samples):
+        """Mirror fixed launch setup, but leave the selected actuator torque OFF."""
+        if self.mock_mode or self.read_only:
+            return samples
+        ids = [int(item) for item in profile.get('actuator_ids', [])]
+        required_modes = self._required_tool_modes(profile)
+        acceleration = int(profile.get('profile_acceleration') or 0)
+        velocity = int(profile.get('profile_velocity') or 0)
+        if acceleration <= 0 or velocity <= 0:
+            raise ToolProfileError(
+                f'{requested} profile velocity/acceleration must be positive')
+        refreshed = {}
+        with self._bus_lock:
+            for dxl_id in ids:
+                torque = self._read_register(
+                    dxl_id, ADDR_TORQUE_ENABLE, 1,
+                    f'{requested} torque pre-config')
+                if torque != TORQUE_DISABLE:
+                    self._write_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1, TORQUE_DISABLE,
+                        f'{requested} torque disable before profile setup')
+                    torque = self._read_register(
+                        dxl_id, ADDR_TORQUE_ENABLE, 1,
+                        f'{requested} torque disable readback')
+                    if torque != TORQUE_DISABLE:
+                        raise ToolProfileError(
+                            f'{requested} ID {dxl_id} torque did not turn OFF')
+                required_mode = required_modes.get(
+                    dxl_id, required_modes.get(str(dxl_id)))
+                if required_mode is not None:
+                    self._write_register(
+                        dxl_id, ADDR_OPERATING_MODE, 1, int(required_mode),
+                        f'{requested} operating mode setup')
+                    mode = self._read_register(
+                        dxl_id, ADDR_OPERATING_MODE, 1,
+                        f'{requested} operating mode readback')
+                    if mode != int(required_mode):
+                        raise ToolProfileError(
+                            f'{requested} ID {dxl_id} operating mode readback '
+                            f'{mode} != required {int(required_mode)}')
+                else:
+                    mode = self._read_register(
+                        dxl_id, ADDR_OPERATING_MODE, 1,
+                        f'{requested} operating mode readback')
+                for address, value, label in (
+                        (ADDR_PROFILE_ACCELERATION, acceleration,
+                         f'{requested} profile acceleration'),
+                        (ADDR_PROFILE_VELOCITY, velocity,
+                         f'{requested} profile velocity')):
+                    self._write_register(dxl_id, address, 4, value, label)
+                    actual = self._read_register(
+                        dxl_id, address, 4, f'{label} readback')
+                    if actual != value:
+                        raise ToolProfileError(
+                            f'{label} readback mismatch: {actual} != {value}')
+                if profile.get('backend') == 'cleaner':
+                    self._write_register(
+                        dxl_id, ADDR_GOAL_VELOCITY, 4, 0,
+                        f'{requested} zero goal velocity')
+                    if self._read_register(
+                            dxl_id, ADDR_GOAL_VELOCITY, 4,
+                            f'{requested} zero goal velocity readback',
+                            signed=True) != 0:
+                        raise ToolProfileError(
+                            f'{requested} ID {dxl_id} goal velocity is not zero')
+                position = self._tool_position_tick(
+                    dxl_id,
+                    self._read_register(
+                        dxl_id, ADDR_PRESENT_POSITION, 4,
+                        f'{requested} fresh present position'))
+                if profile.get('backend') != 'cleaner':
+                    self._write_register(
+                        dxl_id, ADDR_GOAL_POSITION, 4,
+                        int(position) & 0xffffffff,
+                        f'{requested} current-position goal sync')
+                    goal = self._tool_position_tick(
+                        dxl_id,
+                        self._read_register(
+                            dxl_id, ADDR_GOAL_POSITION, 4,
+                            f'{requested} goal sync readback'))
+                    if goal != position:
+                        raise ToolProfileError(
+                            f'{requested} ID {dxl_id} goal sync mismatch: '
+                            f'present={position}, goal={goal}')
+                hw_error = self._read_register(
+                    dxl_id, ADDR_HARDWARE_ERROR_STATUS, 1,
+                    f'{requested} hardware error readback')
+                if hw_error != 0:
+                    raise ToolProfileError(
+                        f'{requested} ID {dxl_id} hardware error=0x{hw_error:02X}')
+                sample = dict(samples.get(dxl_id, {}))
+                sample.update({
+                    'id': dxl_id,
+                    'joint': (profile.get('joint_names') or [''])[0],
+                    'online': True,
+                    'operating_mode': int(mode),
+                    'hardware_error': int(hw_error),
+                    'position': int(position),
+                    'effort': sample.get('effort', 0.0),
+                    'torque_state': 'OFF',
+                    'profile_acceleration': acceleration,
+                    'profile_velocity': velocity,
+                })
+                if profile.get('backend') == 'cleaner':
+                    sample['goal_velocity'] = 0
+                refreshed[dxl_id] = sample
+        return refreshed
+
+    def _release_current_tool_for_switch(self, requested):
+        """Stop the current context and confirm any still-present old IDs are torque OFF."""
+        old_ids = list(getattr(self, 'tool_ids', []))
+        if not old_ids:
+            self.tool_motion_allowed = False
+            return
+        self._stop_tool(f'runtime tool change to {requested}')
+        if self.mock_mode or self.read_only or not self.port_connected:
+            return
+        with self._bus_lock:
+            for dxl_id in old_ids:
+                _model, result, error = self.packet_handler.ping(
+                    self.port_handler, dxl_id)
+                if result != 0 or error != 0:
+                    continue
+                torque = self._read_register(
+                    dxl_id, ADDR_TORQUE_ENABLE, 1,
+                    f'old tool ID {dxl_id} torque after stop')
+                if torque != TORQUE_DISABLE:
+                    raise RuntimeError(
+                        f'old tool ID {dxl_id} torque remains ON after STOP')
+
     def _probe_tool_id(self, dxl_id):
         """Ping one candidate under the shared serial-bus lock."""
+        if self.mock_mode:
+            return bool(self._tool_samples.get(int(dxl_id), {}).get('online'))
         with self._bus_lock:
             _model, result, error = self.packet_handler.ping(
                 self.port_handler, int(dxl_id))
@@ -1978,7 +2465,7 @@ class MoveItDynamixelBridge(Node):
         an operator reasonably expects.
         """
         provider = self._bus_tool_identity
-        if provider is None or self.mock_mode or not self.port_connected:
+        if provider is None or not self.port_connected:
             return None
         detected = provider.detected_tool_type()
         self._tool_detection_reason = provider.last_reason
@@ -2056,9 +2543,28 @@ class MoveItDynamixelBridge(Node):
         return self._arm_fsm_state in ToolManager.SAFE_CHANGE_STATES
 
     def _poll_physical_tool(self):
+        """Run at most one bounded detector pass; never strand the next tick."""
+        guard = getattr(self, '_auto_detection_lock', None)
+        if guard is None:  # object-level test doubles construct no ROS node
+            guard = self._auto_detection_lock = threading.Lock()
+        if not guard.acquire(blocking=False):
+            return
+        self._auto_detection_in_progress = True
+        try:
+            self._poll_physical_tool_once()
+        except Exception as exc:
+            # Detection must fail closed in status, not kill the timer or
+            # prevent the following observation from retrying.
+            self._tool_detection_reason = f'automatic detection failed: {exc}'
+            self.get_logger().error(self._tool_detection_reason)
+        finally:
+            self._auto_detection_in_progress = False
+            guard.release()
+
+    def _poll_physical_tool_once(self):
         """Fail closed on detach, then switch only after a stable new signature."""
         provider = self._bus_tool_identity
-        if provider is None or self.mock_mode or not self.port_connected:
+        if provider is None or not self.port_connected:
             return
         if self.tool_type not in provider.supported_tool_types:
             self._tool_detection_reason = (
@@ -2087,10 +2593,18 @@ class MoveItDynamixelBridge(Node):
                 self._tool_detection_reason = provider.last_reason or (
                     f'physical tool changed: {self.tool_type}->{detected}')
                 self._stop_tool('physical end-effector removal detected')
+                self._mark_tool_feedback_offline()
+                self._clear_runtime_sessions()
+                self.tool_fsm = None
+                self._fsm_allowlist = set()
+                self._tool_preparation_state = 'FAILED'
+                self._tool_preparation_error = '물리 도구 분리가 감지되었습니다'
+                self._tool_prepared_generation = None
                 self._tool_detection_observation = None
                 self._tool_detection_count = 0
             finally:
                 self._tool_change_lock.release()
+            self._publish_tool_status_safely()
             return
 
         if detected is None:
@@ -2104,6 +2618,7 @@ class MoveItDynamixelBridge(Node):
         if self.emergency_stop_active:
             self._tool_detection_reason = 'automatic switch blocked by emergency stop latch'
             return
+        detach_latched = self.tool_detached
         if self.tool_detached:
             self.tool_detached = False
             self._tool_detection_reason = 'confirmed replacement tool clears detach latch'
@@ -2118,7 +2633,8 @@ class MoveItDynamixelBridge(Node):
             self._tool_change_pending = detected
             self._tool_change_error = ''
             try:
-                if detected == self.tool_type:
+                if (detected == self.tool_type
+                        and self.control_scope != 'END_EFFECTOR_ONLY'):
                     # A same-type reattachment is observation-only.  Restore
                     # registration/FSM validation but never re-enable torque.
                     self.tool_discovered = self._discover_tool_ids()
@@ -2140,6 +2656,8 @@ class MoveItDynamixelBridge(Node):
                 self._physical_tool_detached = False
                 self._tool_detection_reason = ''
             except Exception as exc:
+                if self.control_scope == 'END_EFFECTOR_ONLY':
+                    self.tool_detached = detach_latched
                 self._tool_change_error = str(exc)
                 self._tool_detection_reason = str(exc)
                 self.get_logger().error(
@@ -2148,6 +2666,7 @@ class MoveItDynamixelBridge(Node):
                 self._tool_change_pending = None
         finally:
             self._tool_change_lock.release()
+        self._publish_tool_status_safely()
 
     def _configure_tool_actuators(self):
         """Apply profile motion limits only after strict validation and discovery."""
@@ -2183,6 +2702,38 @@ class MoveItDynamixelBridge(Node):
 
     def _stop_tool(self, reason):
         """Best-effort stop for emergency, detach, cancellation, and shutdown."""
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            self.tool_motion_allowed = False
+            self.cleaning_running = False
+            if self.tool_fsm is not None:
+                self.tool_fsm.state = type(self.tool_fsm.state).STOPPED
+            for session in (self.calibration_session, self.dual_calibration_session):
+                if session is not None:
+                    session.stop()
+            self.spur_manual_control.deadline = None
+            with self._cleaner_command_state_lock:
+                self._cleaner_command_generation += 1
+                self._cleaner_requested_velocity = 0
+            with self._bus_lock:
+                for dxl_id in self.tool_ids:
+                    if self.mock_mode and not self.read_only:
+                        sample = self._tool_samples.setdefault(dxl_id, {'id': dxl_id})
+                        sample['torque_state'] = 'OFF'
+                        sample['velocity'] = 0
+                    elif not self.read_only:
+                        try:
+                            self._write_register(dxl_id, ADDR_GOAL_VELOCITY, 4, 0,
+                                                 'tool stop velocity')
+                        except Exception as exc:
+                            self.get_logger().warn(f'ID{dxl_id} stop velocity: {exc}')
+                        try:
+                            self._write_register(dxl_id, ADDR_TORQUE_ENABLE, 1, 0,
+                                                 'tool stop torque')
+                        except Exception as exc:
+                            self.get_logger().error(f'ID{dxl_id} stop torque: {exc}')
+                self._readback_tool_torque()
+            self.get_logger().warn(f'tool actuator stopped: {reason}')
+            return
         self.tool_motion_allowed = False
         self.cleaning_running = False
         if isinstance(getattr(self, 'tool_fsm', None), CleanerFSM):
@@ -2230,6 +2781,9 @@ class MoveItDynamixelBridge(Node):
     def _publish_tool_status_safely(self):
         """Keep a status serialization fault from silently stopping updates."""
         try:
+            # publish_tool_status serializes cached samples only.  Taking the
+            # bus lock here made an absent-ID probe suppress every status tick
+            # while the automatic detector owned the serial transaction.
             self.publish_tool_status()
         except Exception as exc:  # pragma: no cover - hardware/runtime guard
             self.get_logger().error(f'/tool/status publish failed: {exc}')
@@ -2247,37 +2801,82 @@ class MoveItDynamixelBridge(Node):
                 self.get_logger().error(f'runtime tool change rejected: {exc}')
             finally:
                 self._tool_change_pending = None
+                self._publish_tool_status_safely()
 
     def _switch_tool_runtime(self, requested):
+        if self.control_scope != 'END_EFFECTOR_ONLY':
+            return self._switch_tool_runtime_impl(requested)
+        # Context replacement is serialized by _tool_change_lock.  Do not
+        # hold _bus_lock across profile/FSM/session work: those helpers take
+        # it themselves for their individual read/write transactions.
+        generation = self._tool_context_generation
+        self._runtime_switching = True
+        self._tool_preparation_state = 'PREPARING'
+        self._tool_preparation_error = ''
+        self._tool_prepared_generation = None
+        try:
+            return self._switch_tool_runtime_impl(requested)
+        except Exception as exc:
+            self._tool_preparation_state = 'FAILED'
+            self._tool_preparation_error = str(exc)
+            self._tool_prepared_generation = None
+            if generation != self._tool_context_generation:
+                self._stop_tool('runtime switch failed')
+                self.tool_discovered = False
+                self._physical_tool_detached = True
+                self._clear_runtime_sessions()
+                self._fsm_allowlist = set()
+                self._unregister_tool_feedback_ids(self.tool_ids)
+            raise
+        finally:
+            self._runtime_switching = False
+
+    def _clear_runtime_sessions(self):
+        for session in (self.calibration_session, self.dual_calibration_session):
+            if session is not None:
+                session.stop()
+                session.captures.clear()
+                session.validated = False
+        self.calibration_session = None
+        self.dual_calibration_session = None
+        self.dual_manual_recovery = None
+        self.spur_manual_control = SpurManualControl(self)
+        self.calibration_endpoints = {}
+        self._contact_grasp_event = None
+        self._gripper_reboot_times = []
+
+    def _unregister_tool_feedback_ids(self, ids):
+        """Retire only old SDK SyncRead entries in one short bus transaction."""
+        with self._bus_lock:
+            for dxl_id in ids:
+                self.group_sync_read.removeParam(dxl_id)
+                self.active_ids.discard(dxl_id)
+                self.torque_enabled_ids.discard(dxl_id)
+
+    def _switch_tool_runtime_impl(self, requested):
         supported = ('spur_1motor_gripper', 'dual_motor_gripper', 'cleaner')
         if requested not in supported:
             raise ToolProfileError(
                 f'runtime switching supports only {supported}, got {requested!r}')
-        if requested == self.tool_type:
+        if requested == self.tool_type and self.control_scope != 'END_EFFECTOR_ONLY':
             self._revalidate_current_tool()
             return
         if self.emergency_stop_active or self.tool_detached:
             raise RuntimeError('runtime tool change blocked by emergency stop or detached latch')
         if self._gripper_goal_active:
             raise RuntimeError('runtime tool change blocked while gripper motion is active')
+        self._tool_preparation_state = 'PREPARING'
+        self._tool_preparation_error = ''
         old_fsm = self.tool_fsm
-        if self.tool_type == 'cleaner':
-            old_fsm = None  # Switching stops the velocity adapter before unregistering it.
-        if old_fsm and old_fsm.state not in (
-                ToolState.READY, ToolState.OPEN, ToolState.CLOSED,
-                ToolState.CALIBRATION_REQUIRED, ToolState.STOPPED):
-            offline_safe = (old_fsm.state == ToolState.FAULT
-                            and not self.tool_discovered
-                            and not (self.torque_enabled_ids & set(self.tool_ids)))
-            if not offline_safe:
-                raise RuntimeError(
-                    f'runtime tool change unavailable in {old_fsm.state.name}')
+        old_state_name = getattr(getattr(old_fsm, 'state', None), 'name', None)
 
         profiles = load_profiles(self.get_parameter('tool_profile_file').value)
         manager = ToolManager(
             profiles, ParameterToolIdentityProvider(requested),
             mock_mode=self.mock_mode)
         selection = manager.refresh('IDLE')
+        if self.control_scope == 'END_EFFECTOR_ONLY' and not selection.valid:
+            raise ToolProfileError(selection.reason)
         new_ids = [int(item) for item in selection.profile.get('actuator_ids', [])]
         expected_ids = {'spur_1motor_gripper': [5], 'dual_motor_gripper': [3, 4]}.get(requested, new_ids)
         if new_ids != expected_ids:
@@ -2290,39 +2889,29 @@ class MoveItDynamixelBridge(Node):
             if new_ids[0] in ARM_IDS:
                 raise ToolProfileError('cleaner actuator conflicts with an arm joint')
 
-        # An operator's request is also an explicit physical rescan.  Do this
-        # before stopping/unregistering the active tool so a wrong selection
-        # cannot leave a healthy tool half-switched.  The error names the
-        # observed IDs instead of incorrectly calling the motor "undetected".
+        # A manual GUI request is authoritative: validate exactly the selected
+        # profile's IDs, but do not ask the automatic identity provider to
+        # choose a different tool.  In the END_EFFECTOR_ONLY bench workflow
+        # auto_tool_detection is intentionally false, so _bus_tool_identity is
+        # absent; using it here caused None.last_present_ids rejections.
+        verified_samples = {}
         if not self.mock_mode and self.port_connected:
-            detected = self._rescan_physical_tool()
-            present = sorted(self._bus_tool_identity.last_present_ids)
-            if detected != requested:
-                raise ToolProfileError(
-                    f'requested {requested} expects actuator IDs {new_ids}; '
-                    f'bus re-scan found IDs {present} '
-                    f'({detected or self._bus_tool_identity.last_reason})')
+            verified_samples = self._verify_requested_tool_profile(
+                requested, selection.profile,
+                configure=self.control_scope == 'END_EFFECTOR_ONLY')
 
-        # Stop and unregister the old tool before changing the allowlist.  This
-        # New cleaner velocity-mode setup follows discovery below.
+        # Stop and unregister the old tool before changing the allowlist.
         old_ids = list(self.tool_ids)
-        old_torque_on = (bool(self.torque_enabled_ids & set(old_ids))
-                         or bool(getattr(self, 'cleaning_running', False))
-                         or any(sample.get('torque_state') == 'ON'
-                                for sample in getattr(self, '_tool_samples', {}).values()))
-        if old_torque_on:
-            self._stop_tool(f'runtime tool change to {requested}')
-        else:
-            self.tool_motion_allowed = False
-            if old_fsm is not None:
-                old_fsm.state = ToolState.STOPPED
-        for dxl_id in old_ids:
-            try:
-                self.group_sync_read.delParam(dxl_id)
-            except Exception:
-                pass
-            self.active_ids.discard(dxl_id)
-            self.torque_enabled_ids.discard(dxl_id)
+        self._release_current_tool_for_switch(requested)
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            self._tool_context_generation += 1
+            self._clear_runtime_sessions()
+            self.tool_fsm = None
+        # Dynamixel SDK GroupSyncRead uses removeParam(), not delParam().
+        # The old spelling was swallowed above, leaving absent cleaner ID2
+        # in every subsequent dual SyncRead packet and tripping feedback loss
+        # immediately after both motors were enabled.
+        self._unregister_tool_feedback_ids(old_ids)
 
         self.cleaning_running = False
         self.cleaning_configured = False
@@ -2341,10 +2930,21 @@ class MoveItDynamixelBridge(Node):
 
         if hasattr(self, 'spur_manual_control'):
             self.spur_manual_control.deadline = None
+        self._last_gripper_goal_tick = None
+        self._gripper_goal_active = False
+        self._gripper_recovering = False
+        self._gripper_overload_gave_up = False
         self.tool_type = requested
         self.tool_manager = manager
         self.tool_selection = selection
         self.tool_profile = selection.profile
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            self.temporary_jog_enabled = bool(
+                self.temporary_jog_mode and requested == 'spur_1motor_gripper'
+                and self.temporary_jog_safe_min < self.temporary_jog_safe_max)
+            self.calibration_jog_enabled = bool(
+                self.calibration_jog_mode and requested == 'spur_1motor_gripper'
+                and self.calibration_max_jog_ticks in (6, 12))
         self.tool_ids = new_ids
         self.gripper_ids = new_ids if requested != 'cleaner' else []
         self.gripper_joints = list(self.tool_profile.get('joint_names', []))
@@ -2366,29 +2966,44 @@ class MoveItDynamixelBridge(Node):
                 self._tool_samples[dxl_id] = {
                     'id': dxl_id, 'joint': joint_names[0],
                     'position': seed_tick, 'effort': 0.0, 'online': True,
-                    'hardware_error': 0, 'torque_state': 'OFF'}
+                    'model': 1060, 'operating_mode': (
+                        1 if requested == 'cleaner'
+                        else int((self._required_tool_modes(self.tool_profile)
+                                  or {}).get(dxl_id, 3))),
+                    'hardware_error': 0, 'torque_state': 'OFF',
+                    'goal_velocity': 0 if requested == 'cleaner' else None,
+                    'profile_acceleration': int(
+                        self.tool_profile.get('profile_acceleration') or 0),
+                    'profile_velocity': int(
+                        self.tool_profile.get('profile_velocity') or 0)}
         elif self.port_connected:
-            self.tool_discovered = self._discover_tool_ids()
+            self.tool_discovered = bool(verified_samples) or self._discover_tool_ids()
             if self.tool_discovered:
+                verified_samples = self._runtime_configure_selected_tool(
+                    requested, self.tool_profile, verified_samples)
                 for dxl_id in self.tool_ids:
                     self.group_sync_read.addParam(dxl_id)
                     self.active_ids.add(dxl_id)
+                self._tool_samples.update(verified_samples)
         else:
             self.tool_motion_allowed = False
-
-        if (requested == 'cleaner' and self.cleaning_configured
-                and self.tool_discovered and not self.mock_mode and not self.read_only):
-            self._configure_cleaning_actuator()
 
         self._fsm_allowlist = set()
         # Retain the existing mission FSM and its /cleaning/enable adapter.
         self.tool_fsm = None
         if requested == 'cleaner':
             self.tool_fsm = CleanerFSM(self.tool_profile, self)
-            self.tool_fsm.startup()
+            state = self.tool_fsm.startup()
+            if state == ToolState.FAULT:
+                raise RuntimeError(
+                    self.tool_fsm.fault_reason or 'CleanerFSM startup failed')
         else:
             self.tool_fsm = manager.create_fsm(self)
-            self.tool_fsm.startup()
+            state = self.tool_fsm.startup()
+            if state == ToolState.FAULT:
+                raise RuntimeError(
+                    self.tool_fsm.fault_reason or
+                    f'{requested} startup validation failed')
         self.calibration_session = None
         self.dual_manual_recovery = None
         self.dual_calibration_session = None
@@ -2398,9 +3013,33 @@ class MoveItDynamixelBridge(Node):
             self.dual_manual_recovery = DualManualRecovery(self)
             self.dual_calibration_session = DualCalibrationSession(
                 self, self.tool_profile)
+
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            self._physical_tool_detached = False
+            state = getattr(getattr(self.tool_fsm, 'state', None), 'name', None)
+            if state != 'READY':
+                raise RuntimeError(
+                    f'{type(self.tool_fsm).__name__} startup returned {state}, '
+                    'expected READY')
+            reason = self._tool_enable_block_reason()
+            if reason:
+                raise RuntimeError(f'tool preparation failed: {reason}')
+            torque_state = self._current_tool_torque_state()
+            if torque_state != 'OFF':
+                raise RuntimeError(
+                    f'tool preparation did not confirm Torque OFF: {torque_state}')
+            self._tool_preparation_state = 'READY'
+            self._tool_preparation_error = ''
+            self._tool_prepared_generation = self._tool_context_generation
+        auto_enabled = self._maybe_auto_enable_attached_tool()
+
         self.get_logger().info(
-            f'runtime tool change complete: tool_type={requested}, ids={self.tool_ids}, '
-            f'fsm={self.tool_fsm.__class__.__name__}')
+            f'runtime tool change complete: '
+            f'tool_type={requested}, '
+            f'ids={self.tool_ids}, '
+            f'fsm={self.tool_fsm.__class__.__name__}, '
+            f'old_state={old_state_name}, '
+            f'torque={"ON" if auto_enabled else "OFF"}')
 
     def publish_tool_status(self):
         self.tool_type_pub.publish(String(data=self.tool_type))
@@ -2414,6 +3053,7 @@ class MoveItDynamixelBridge(Node):
         elif self.read_only:
             reason = 'read-only diagnostic mode'
         id5 = self._tool_samples.get(5, {})
+        tool_torque_state = self._current_tool_torque_state()
         fsm_fault = (self.tool_fsm.fault_reason
                      if self.tool_fsm and self.tool_fsm.state.name == 'FAULT'
                      else None)
@@ -2438,6 +3078,8 @@ class MoveItDynamixelBridge(Node):
         status = {
             'control_scope': self.control_scope,
             'tool_type': self.tool_type,
+            'tool_context_generation': self._tool_context_generation,
+            'fsm_class': type(self.tool_fsm).__name__ if self.tool_fsm else None,
             'tool_profile': self.tool_profile,
             'backend': self.tool_profile.get('backend', 'invalid'),
             'profile_valid': bool(self.tool_selection and self.tool_selection.valid),
@@ -2448,12 +3090,16 @@ class MoveItDynamixelBridge(Node):
             'developer_direct_mode': self.developer_direct_mode,
             'temporary_jog_ready': self._tool_backend_ready(),
             'tool_enable_allowed': self._tool_enable_allowed(),
+            'tool_enable_reason': (
+                self._tool_enable_block_reason()
+                if self.control_scope == 'END_EFFECTOR_ONLY' else ''),
+            'tool_preparation_state': self._tool_preparation_state,
+            'tool_preparation_error': self._tool_preparation_error,
+            'tool_preparation_generation': self._tool_prepared_generation,
             # This is a register observation, never the bridge's ownership
             # bookkeeping.  UNKNOWN stays distinct from OFF in the GUI.
-            'tool_torque_state': self._tool_samples.get(5, {}).get('torque_state',
-                                                                     'UNKNOWN'),
-            'tool_torque_enabled': self._tool_samples.get(5, {}).get(
-                'torque_state') == 'ON',
+            'tool_torque_state': tool_torque_state,
+            'tool_torque_enabled': tool_torque_state == 'ON',
             'actuators_discovered': self.tool_discovered,
             'motion_allowed': self._tool_backend_ready(),
             'read_only': self.read_only, 'mock_mode': self.mock_mode,
@@ -2494,6 +3140,7 @@ class MoveItDynamixelBridge(Node):
             'model': id5.get('model'),
             'fault': fsm_fault,
             'synchronization': synchronization,
+            'contact_grasp': self._contact_grasp_event,
             'cleaning_running': self.cleaning_running,
             'cleaning_configured': self.cleaning_configured,
             'tool_change': {
@@ -2503,6 +3150,24 @@ class MoveItDynamixelBridge(Node):
             },
         }
         self.tool_status_pub.publish(String(data=json.dumps(status, sort_keys=True)))
+
+    def _current_tool_torque_state(self):
+        """Aggregate the selected tool's observed torque state for the GUI."""
+        if not self.tool_ids:
+            return 'UNKNOWN'
+        states = [
+            (self._tool_samples.get(dxl_id) or {}).get('torque_state')
+            for dxl_id in self.tool_ids]
+        if (self.control_scope == 'END_EFFECTOR_ONLY'
+                and any(state not in ('ON', 'OFF') for state in states)):
+            return 'UNKNOWN'
+        if any(state is None for state in states):
+            return 'UNKNOWN'
+        if all(state == 'ON' for state in states):
+            return 'ON'
+        if all(state == 'OFF' for state in states):
+            return 'OFF'
+        return 'MIXED'
 
     def _tool_actuators_online(self):
         """Return true only when every profile-selected actuator is online."""
@@ -2514,9 +3179,15 @@ class MoveItDynamixelBridge(Node):
             for dxl_id in self.tool_ids)
 
     def _tool_backend_ready(self):
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            return bool(self._tool_enable_allowed() and self.tool_motion_allowed
+                        and self._current_tool_torque_state() == 'ON'
+                        and self.tool_fsm.state.name in (
+                            'READY', 'OPEN', 'CLOSED', 'OPENING', 'CLOSING', 'CLEANING'))
         if self.tool_type == 'cleaner' and self.mock_mode:
-            return bool(self.tool_motion_allowed and not self.read_only
-                        and not self.emergency_stop_active and not self.tool_detached)
+            return bool(
+                self._tool_enable_allowed()
+                and set(self.tool_ids).issubset(self.torque_enabled_ids))
         if self.tool_type == 'spur_1motor_gripper' and self.tool_ids == [5]:
             return bool(
                 self._tool_enable_allowed()
@@ -2546,9 +3217,85 @@ class MoveItDynamixelBridge(Node):
             and 0 < sample['profile_velocity'] <= 5
             and 0 < sample['profile_acceleration'] <= 1
             and not self.emergency_stop_active and not self.tool_detached)
+    def _maybe_auto_enable_attached_tool(self):
+        """Retain legacy auto-enable policy outside operator-switched EEO tools.
+
+        END_EFFECTOR_ONLY always requires an explicit GUI activation request.
+        """
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            if self.auto_enable_on_attach:
+                self.get_logger().warn(
+                    'auto torque-on after attach is forbidden in END_EFFECTOR_ONLY; '
+                    'use the GUI activation button')
+            return False
+
+        if not self.auto_enable_on_attach:
+            return False
+
+        if self.control_scope != 'END_EFFECTOR_ONLY':
+            return False
+
+        if self.tool_type not in (
+                'dual_motor_gripper',
+                'spur_1motor_gripper', 'cleaner'):
+            return False
+
+        if self.read_only:
+            return False
+
+        if self.emergency_stop_active or self.tool_detached:
+            return False
+
+        if not self.tool_fsm:
+            return False
+
+        if self.tool_fsm.state.name != 'READY':
+            self.get_logger().info(
+                f'auto-enable skipped: FSM state={self.tool_fsm.state.name}')
+            return False
+
+        if not self._tool_enable_allowed():
+            self.get_logger().info(
+                'auto-enable skipped: tool enable gate not ready')
+            return False
+
+        if not self.tool_ids:
+            return False
+
+        self.get_logger().info(
+            f'auto-enable requested after attach: '
+            f'tool={self.tool_type}, ids={self.tool_ids}')
+
+        msg = Int32MultiArray()
+        msg.data = [1, *self.tool_ids]
+        msg.layout.dim = [MultiArrayDimension(
+            label=f'tool_context:{self._tool_context_generation}',
+            size=len(msg.data), stride=len(msg.data))]
+
+        # IMPORTANT:
+        # Reuse the normal enable path.  This performs profile validation,
+        # present-position -> goal synchronization, torque write/readback,
+        # and dual partial-enable rollback.
+        self.torque_request_callback(msg)
+
+        enabled = all(
+            dxl_id in self.torque_enabled_ids
+            for dxl_id in self.tool_ids
+        )
+
+        if enabled:
+            self.get_logger().info(
+                f'auto-enable complete: IDs {self.tool_ids}')
+        else:
+            self.get_logger().warn(
+                f'auto-enable did not complete: IDs {self.tool_ids}')
+
+        return enabled
 
     def _tool_enable_allowed(self):
         """Safety gate for explicit torque enable; does not require torque yet."""
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            return not bool(self._tool_enable_block_reason())
         if self.mock_mode:
             return True
         profile_ready = bool(self.tool_selection and self.tool_selection.valid
@@ -2562,6 +3309,96 @@ class MoveItDynamixelBridge(Node):
             and self.tool_discovered and self._tool_actuators_online()
             and self.tool_motion_allowed and not self.read_only
             and not self.emergency_stop_active and not self.tool_detached)
+
+    def _tool_enable_block_reason(self):
+        """Return an operator-readable reason when current-tool enable is unsafe."""
+        if self.control_scope != 'END_EFFECTOR_ONLY':
+            return ''
+        if not self.tool_selection or not self.tool_selection.valid:
+            return (self.tool_selection.reason if self.tool_selection
+                    else '도구 profile을 읽을 수 없습니다')
+        if not self.tool_profile.get('calibrated'):
+            return '도구 보정이 유효하지 않습니다'
+        if self.emergency_stop_active:
+            return '비상 정지 래치가 설정되어 있습니다'
+        if self.tool_detached or self._physical_tool_detached:
+            return '도구 분리 상태입니다'
+        if self.read_only:
+            return '읽기 전용 모드에서는 활성화할 수 없습니다'
+        expected_ids = [int(item) for item in
+                        self.tool_profile.get('actuator_ids', [])]
+        if not expected_ids or self.tool_ids != expected_ids:
+            return (f'profile actuator IDs 불일치: expected={expected_ids}, '
+                    f'active={self.tool_ids}')
+        # The real SDK keeps a separate SyncRead ID registry.  A stale ID
+        # from the previous attachment makes all current-tool feedback fail
+        # even when direct ping/mode/torque readback succeeds.
+        registry = getattr(getattr(self, 'group_sync_read', None), 'data_dict', None)
+        if (not getattr(self, 'mock_mode', False) and isinstance(registry, dict)
+                and set(registry) != set(expected_ids)):
+            return (f'feedback actuator IDs 불일치: expected={expected_ids}, '
+                    f'registered={sorted(registry)}')
+        if not self.tool_discovered:
+            return 'profile actuator가 감지되지 않았습니다'
+        # tool_motion_allowed is deliberately false after STOP/torque-OFF.
+        # It describes current motion permission, not whether an explicit
+        # enable can be requested; _end_effector_torque_request revalidates
+        # the current profile and sets it true only after all safety checks.
+        if not self.tool_fsm:
+            return 'tool FSM이 생성되지 않았습니다'
+        if self.tool_fsm.state.name not in (
+                'STOPPED', 'READY', 'OPEN', 'CLOSED',
+                'OPENING', 'CLOSING', 'CLEANING'):
+            return f'FSM state={self.tool_fsm.state.name}은 활성화를 허용하지 않습니다'
+
+        required_modes = self._required_tool_modes(self.tool_profile)
+        expected_models = self.tool_profile.get('endpoint_calibration_models') or {}
+        for dxl_id in expected_ids:
+            sample = self._tool_samples.get(dxl_id)
+            if not isinstance(sample, dict) or sample.get('id') != dxl_id:
+                return f'ID{dxl_id} actuator sample이 없습니다'
+            if not sample.get('online'):
+                return f'ID{dxl_id} actuator가 offline입니다'
+            if sample.get('hardware_error') != 0:
+                return f'ID{dxl_id} hardware_error={sample.get("hardware_error")!r}'
+            expected_model = expected_models.get(
+                dxl_id, expected_models.get(
+                    str(dxl_id), self.tool_profile.get('motor_model')))
+            if (expected_model is not None
+                    and sample.get('model') != int(expected_model)):
+                return (f'ID{dxl_id} model mismatch: '
+                        f'expected={expected_model}, actual={sample.get("model")}')
+            if sample.get('torque_state') not in ('ON', 'OFF'):
+                return f'ID{dxl_id} torque_state를 읽을 수 없습니다'
+            if sample.get('position') is None:
+                return f'ID{dxl_id} 현재 위치를 읽을 수 없습니다'
+            required_mode = required_modes.get(
+                dxl_id, required_modes.get(str(dxl_id)))
+            if required_mode is not None:
+                actual_mode = sample.get('operating_mode')
+                if actual_mode is None:
+                    return f'ID{dxl_id} operating_mode readback이 없습니다'
+                if int(actual_mode) != int(required_mode):
+                    return (f'ID{dxl_id} operating_mode={actual_mode}, '
+                            f'required={required_mode}')
+            if (self.tool_type == 'cleaner'
+                    and sample.get('torque_state') == 'OFF'
+                    and sample.get('goal_velocity') != 0):
+                return (f'cleaner ID{dxl_id} goal_velocity가 0으로 확인되지 않았습니다: '
+                        f'{sample.get("goal_velocity")}')
+
+        if self.tool_type == 'dual_motor_gripper':
+            session = self.dual_calibration_session
+            if session is None or not session.is_ready or session.active:
+                return 'dual gripper endpoint calibration이 준비되지 않았습니다'
+            try:
+                positions = {i: self._tool_samples[i]['position'] for i in self.tool_ids}
+                spread = self._dual_normalized_spread(positions)[1]
+                if spread > 0.05:
+                    return f'dual motor synchronization spread={spread:.4f} > 0.0500'
+            except (RuntimeError, KeyError, TypeError, ValueError) as exc:
+                return f'dual motor synchronization을 확인할 수 없습니다: {exc}'
+        return ''
 
     def _configure_temporary_jog_actuator(self):
         """Register only ID 5 for a guarded, torque-off bench session."""
@@ -2681,26 +3518,58 @@ class MoveItDynamixelBridge(Node):
 
     def _cleaner_direction_command(self, command):
         if command == 'STOP':
-            self._on_cleaning_enable(Bool(data=False))
-            return
+            return bool(self._on_cleaning_enable(Bool(data=False)))
         direct_bench = bool(
             self.developer_direct_mode
             and self.control_scope == 'END_EFFECTOR_ONLY')
         if (command not in ('LEFT', 'RIGHT')
                 or (not direct_bench and self.control_mode != 'MANUAL')):
-            return
+            return False
         if not self.cleaning_configured or not self.tool_discovered:
             self.get_logger().warn('Cleaner direction command requires a configured actuator')
-            return
-        self._on_cleaning_enable(Bool(data=True), 1 if command == 'LEFT' else -1)
+            return False
+        return bool(self._on_cleaning_enable(
+            Bool(data=True), 1 if command == 'LEFT' else -1))
+
+    def _tool_request_current(self, request):
+        if self.control_scope != 'END_EFFECTOR_ONLY':
+            return True
+        if not isinstance(request, dict):
+            return False
+        current = (
+            request.get('tool_type') == self.tool_type
+            and 'tool_context_generation' in request
+            and request.get('tool_context_generation')
+            == self._tool_context_generation)
+        if not current:
+            self.get_logger().warn('Ignoring request from a replaced tool context')
+        return current
 
     def _on_cleaning_direction(self, msg):
         """Dedicated immediate LEFT/RIGHT/STOP ingress for the GUI buttons."""
-        self._cleaner_direction_command(str(msg.data).strip().upper())
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            with self._bus_lock:
+                return self._dispatch_cleaning_direction(msg)
+        return self._dispatch_cleaning_direction(msg)
+
+    def _dispatch_cleaning_direction(self, msg):
+        command = str(msg.data).strip()
+        if command.startswith('{'):
+            try:
+                request = json.loads(command)
+                if not self._tool_request_current(request):
+                    return
+                command = str(request['command'])
+            except (ValueError, KeyError, TypeError):
+                return
+        self._cleaner_direction_command(command.upper())
 
     def _on_cleaning_enable(self, msg, rotation=1):
         if self.tool_type != 'cleaner' or self.read_only:
-            return
+            return False
+        if (self.control_scope == 'END_EFFECTOR_ONLY' and msg.data
+                and not self._tool_backend_ready()):
+            return False
         direct_bench = bool(
             self.developer_direct_mode
             and self.control_scope == 'END_EFFECTOR_ONLY')
@@ -2712,7 +3581,7 @@ class MoveItDynamixelBridge(Node):
                          or (not direct_bench and not self.tool_motion_allowed)
                          or (not direct_bench
                              and self.control_mode not in ('MANUAL', 'FSM'))):
-            return
+            return False
         if self.mock_mode:
             self.cleaning_running = bool(msg.data)
             if isinstance(self.tool_fsm, CleanerFSM):
@@ -2720,15 +3589,16 @@ class MoveItDynamixelBridge(Node):
             for sample in self._tool_samples.values():
                 sample['velocity'] = (rotation * self.cleaning_direction * self.cleaning_velocity_raw
                                       if msg.data else 0)
-            return
+            return True
         if (not self.cleaning_configured or not self.tool_discovered
                 or (msg.data and not direct_bench
                     and not self._tool_backend_ready())):
             self.get_logger().error('Cleaning actuator/profile is not ready')
-            return
+            return False
         velocity = (rotation * self.cleaning_direction * self.cleaning_velocity_raw
                     if msg.data else 0)
         self._submit_cleaner_velocity(int(velocity))
+        return True
 
     def _submit_cleaner_velocity(self, velocity):
         """Preempt older cleaner requests; perform only the latest write.
@@ -2752,6 +3622,7 @@ class MoveItDynamixelBridge(Node):
                     generation = self._cleaner_command_generation
                     requested = self._cleaner_requested_velocity
                     actuator_id = self.cleaning_actuator_id
+                    context = self._tool_context_generation
                 if (self.tool_type != 'cleaner'
                         or actuator_id < 0 or not self.cleaning_configured):
                     return
@@ -2759,17 +3630,30 @@ class MoveItDynamixelBridge(Node):
                     # This remains serialized with feedback and detection,
                     # but no stale motion command can be queued behind it.
                     with self._bus_lock:
+                        if self.control_scope == 'END_EFFECTOR_ONLY':
+                            if (context != self._tool_context_generation
+                                    or self._runtime_switching
+                                    or self.tool_type != 'cleaner'):
+                                return
+                            if generation != self._cleaner_command_generation:
+                                continue
+                            if requested and not self._tool_backend_ready():
+                                return
                         self._write_register(
                             actuator_id, ADDR_GOAL_VELOCITY, 4,
                             requested & 0xffffffff,
                             'cleaner goal velocity')
+                        if self.control_scope == 'END_EFFECTOR_ONLY':
+                            self.cleaning_running = bool(requested)
+                            self.tool_fsm.observe_command(bool(requested))
                 except Exception as exc:
                     self.get_logger().error(
                         f'Cleaning velocity write failed: {exc}')
                     return
-                self.cleaning_running = bool(requested)
-                if isinstance(self.tool_fsm, CleanerFSM):
-                    self.tool_fsm.observe_command(bool(requested))
+                if self.control_scope != 'END_EFFECTOR_ONLY':
+                    self.cleaning_running = bool(requested)
+                    if isinstance(self.tool_fsm, CleanerFSM):
+                        self.tool_fsm.observe_command(bool(requested))
                 with self._cleaner_command_state_lock:
                     if generation == self._cleaner_command_generation:
                         self._cleaner_command_active = False
@@ -2818,8 +3702,8 @@ class MoveItDynamixelBridge(Node):
             (value >> 24) & 0xFF,
         ]
 
-    def _tool_position_tick(self, dxl_id, raw_tick):
-        endpoints = self.tool_profile.get('motor_endpoints') or {}
+    def _tool_position_tick(self, dxl_id, raw_tick, profile=None):
+        endpoints = (self.tool_profile if profile is None else profile).get('motor_endpoints') or {}
         endpoint = endpoints.get(dxl_id, endpoints.get(str(dxl_id), {}))
         if any(value is not None and value < 0 for value in endpoint.values()):
             return to_signed(raw_tick, LEN_PRESENT_POSITION)
@@ -3461,6 +4345,12 @@ class MoveItDynamixelBridge(Node):
             self._tool_samples[dxl_id] = sample
 
     def publish_joint_states(self):
+        if self.control_scope == 'END_EFFECTOR_ONLY':
+            with self._bus_lock:
+                return self._publish_joint_states_impl()
+        return self._publish_joint_states_impl()
+
+    def _publish_joint_states_impl(self):
         if self.mock_mode:
             msg = JointState()
             msg.header.stamp = self.get_clock().now().to_msg()
@@ -3548,11 +4438,27 @@ class MoveItDynamixelBridge(Node):
                 load_raw, tick, hw_error = sample
                 tick = self._tool_position_tick(self.cleaning_actuator_id, tick)
                 fault = fault or hw_error != 0
-                self._tool_samples[self.cleaning_actuator_id] = {
+                # Feedback used to replace the runtime-configured sample with
+                # position/load only. That discarded the torque/mode fields
+                # needed by _tool_enable_allowed(), leaving a healthy,
+                # torque-OFF cleaner impossible to enable from the GUI.
+                # Refresh the control-table gate fields and merge them with
+                # feedback instead of dropping the attach-time profile data.
+                sample_state = dict(self._tool_samples.get(
+                    self.cleaning_actuator_id, {}))
+                control_state = self._read_tool_control_state(
+                    self.cleaning_actuator_id)
+                sample_state.update(control_state or {
+                    'torque_state': 'UNKNOWN', 'operating_mode': None,
+                    'profile_velocity': None, 'profile_acceleration': None,
+                    'goal_velocity': None})
+                sample_state.update({
                     'id': self.cleaning_actuator_id,
                     'joint': self.cleaning_actuator_joint,
                     'position': int(tick), 'effort': float(abs(load_raw)),
-                    'online': hw_error == 0}
+                    'online': hw_error == 0,
+                    'hardware_error': int(hw_error)})
+                self._tool_samples[self.cleaning_actuator_id] = sample_state
                 tool_msg.name.append(self.cleaning_actuator_joint)
                 tool_msg.position.append(
                     float(to_signed(tick, LEN_PRESENT_POSITION)))
@@ -3592,6 +4498,24 @@ class MoveItDynamixelBridge(Node):
                 else:
                     load_raw, tick, hw_error = sample
                     control = self._read_tool_control_state(dxl_id)
+                    if control is None:
+                        # The SDK may raise while decoding a truncated ID5
+                        # control-table response.  Do not retain the fresh
+                        # position as an apparently usable actuator sample:
+                        # publish this tick as offline and let the next timer
+                        # cycle retry the read.
+                        fault = True
+                        self._tool_samples[dxl_id] = {
+                            'id': dxl_id,
+                            'joint': joint_names[0] if joint_names else '',
+                            'position': None, 'effort': None, 'online': False,
+                            'hardware_error': None, 'torque_state': 'UNKNOWN',
+                            'operating_mode': None, 'profile_velocity': None,
+                            'profile_acceleration': None}
+                        self.joint_state_pub.publish(msg)
+                        self.tool_joint_state_pub.publish(tool_msg)
+                        self.fault_pub.publish(Bool(data=fault))
+                        return
                     fault = fault or hw_error != 0
                     self._tool_samples[dxl_id] = {
                         'id': dxl_id,
@@ -3626,6 +4550,12 @@ class MoveItDynamixelBridge(Node):
                 sample = self._read_sample(gid)
                 if sample is None:
                     fault = True
+                    stale = dict(self._tool_samples.get(gid, {}))
+                    stale.update({
+                        'id': gid, 'online': False, 'position': None,
+                        'effort': None, 'hardware_error': None,
+                        'torque_state': 'UNKNOWN'})
+                    self._tool_samples[gid] = stale
                     continue
                 load_raw, tick, hw_error = sample
                 velocity_raw = 0
@@ -3642,7 +4572,9 @@ class MoveItDynamixelBridge(Node):
                     'joint': self.gripper_joints[0] if self.gripper_joints else '',
                     'position': self._tool_position_tick(gid, tick),
                     'effort': float(load_raw), 'online': hw_error == 0,
-                    'hardware_error': int(hw_error), **control}
+                    'hardware_error': int(hw_error),
+                    'model': self._tool_samples.get(gid, {}).get('model'),
+                    **control}
                 gripper_samples.append(
                     (load_raw, to_signed(tick, LEN_PRESENT_POSITION), velocity_raw))
 
@@ -3666,6 +4598,10 @@ class MoveItDynamixelBridge(Node):
                     except RuntimeError as exc:
                         sync_fault = str(exc)
                 if sync_fault:
+                    if self.control_scope == 'END_EFFECTOR_ONLY':
+                        self._tool_preparation_state = 'FAILED'
+                        self._tool_preparation_error = sync_fault
+                        self._tool_prepared_generation = None
                     self._stop_tool(sync_fault)
                     if self.tool_fsm is not None:
                         self.tool_fsm.fault_reason = str(sync_fault)
@@ -3773,30 +4709,66 @@ class MoveItDynamixelBridge(Node):
         if dxl_id not in self.tool_ids:
             return {'torque_state': 'UNKNOWN', 'operating_mode': None,
                     'profile_velocity': None, 'profile_acceleration': None}
-        with self._bus_lock:
-            torque, tr, te = self.packet_handler.read1ByteTxRx(
-                self.port_handler, dxl_id, ADDR_TORQUE_ENABLE)
-            if dxl_id != 5:
+        try:
+            with self._bus_lock:
+                torque, tr, te = self.packet_handler.read1ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_TORQUE_ENABLE)
+                if dxl_id != 5 and self.control_scope != 'END_EFFECTOR_ONLY':
+                    return {
+                        'torque_state': ('ON' if torque == 1 else 'OFF')
+                        if tr == 0 and te == 0 else 'UNKNOWN',
+                        'operating_mode': None, 'profile_velocity': None,
+                        'profile_acceleration': None, 'goal_velocity': None}
+                mode, mr, me = self.packet_handler.read1ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_OPERATING_MODE)
+                accel, ar, ae = self.packet_handler.read4ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_PROFILE_ACCELERATION)
+                velocity, vr, ve = self.packet_handler.read4ByteTxRx(
+                    self.port_handler, dxl_id, ADDR_PROFILE_VELOCITY)
+                goal_velocity = goal_comm = goal_error = None
+                if self.tool_type == 'cleaner':
+                    goal_velocity, goal_comm, goal_error = (
+                        self.packet_handler.read4ByteTxRx(
+                            self.port_handler, dxl_id, ADDR_GOAL_VELOCITY))
+        except Exception as exc:
+            # Protocol 2 SDK can raise IndexError when a short response is
+            # decoded after the serial port changes state.  Treat only this
+            # ID5 observation sample as unavailable; the periodic callback
+            # must stay alive to report recovery on its next pass.
+            if dxl_id == 5 or self.tool_type == 'cleaner':
+                self.get_logger().warn(
+                    f'tool control-table feedback unavailable: ID{dxl_id}: {exc}')
                 return {
-                    'torque_state': ('ON' if torque == 1 else 'OFF')
-                    if tr == 0 and te == 0 else 'UNKNOWN',
-                    'operating_mode': None, 'profile_velocity': None,
-                    'profile_acceleration': None}
-            mode, mr, me = self.packet_handler.read1ByteTxRx(
-                self.port_handler, dxl_id, ADDR_OPERATING_MODE)
-            accel, ar, ae = self.packet_handler.read4ByteTxRx(
-                self.port_handler, dxl_id, ADDR_PROFILE_ACCELERATION)
-            velocity, vr, ve = self.packet_handler.read4ByteTxRx(
-                self.port_handler, dxl_id, ADDR_PROFILE_VELOCITY)
+                    'torque_state': 'UNKNOWN', 'operating_mode': None,
+                    'profile_velocity': None, 'profile_acceleration': None,
+                    'goal_velocity': None}
+            raise
         return {
             'torque_state': ('ON' if torque == 1 else 'OFF')
                 if tr == 0 and te == 0 else 'UNKNOWN',
             'operating_mode': int(mode) if mr == 0 and me == 0 else None,
             'profile_acceleration': int(accel) if ar == 0 and ae == 0 else None,
             'profile_velocity': int(velocity) if vr == 0 and ve == 0 else None,
+            'goal_velocity': (
+                to_signed(goal_velocity, LEN_GOAL_VELOCITY)
+                if goal_comm == 0 and goal_error == 0 else None),
         }
 
     def destroy_node(self):
+        # ActionServer is a Node waitable, but it also owns action-specific DDS
+        # entities.  Destroy it explicitly while the node/context are still
+        # alive; otherwise repeated mock contexts can leave those entities for
+        # interpreter shutdown and Fast DDS may corrupt its allocator.
+        for name in (
+                'action_server', 'gripper_action_server',
+                'rotate_action_server', 'arm_test_action_server',
+                'arm_recorded_path_action_server'):
+            server = getattr(self, name, None)
+            if server is not None:
+                try:
+                    server.destroy()
+                finally:
+                    setattr(self, name, None)
         # A calibration-monitor window must not change the pre-existing torque
         # state merely because the GUI is closed.  Explicit STOP/DISABLE and
         # E-stop still call _stop_tool while it is running.

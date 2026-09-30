@@ -19,6 +19,7 @@ def generate_launch_description():
     start_fsm = LaunchConfiguration('start_fsm')
     tool_type = LaunchConfiguration('tool_type')
     control_scope = LaunchConfiguration('control_scope')
+    auto_enable = LaunchConfiguration('auto_enable_on_attach')
     developer_direct_mode = LaunchConfiguration('developer_direct_mode')
     gripper_tolerance = LaunchConfiguration('gripper_target_tolerance_ticks')
     temporary_jog_mode = LaunchConfiguration('temporary_jog_mode')
@@ -44,6 +45,7 @@ def generate_launch_description():
             'read_only': read_only,
             'tool_type': tool_type,
             'control_scope': control_scope,
+            'auto_enable_on_attach': auto_enable,
             'developer_direct_mode': developer_direct_mode,
             'gripper_target_tolerance_ticks': gripper_tolerance,
             'temporary_jog_mode': temporary_jog_mode,
@@ -89,6 +91,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'control_scope', default_value='FULL_ROBOT',
             description='Arm joints 1–5 and the interchangeable tool share one bridge.'),
+        DeclareLaunchArgument(
+            'auto_enable_on_attach', default_value='false',
+            description='Enable a validated runtime attachment in END_EFFECTOR_ONLY scope.'),
         DeclareLaunchArgument(
             'developer_direct_mode', default_value='false',
             description='ID5-only direct bench controls; retains physical safety gates.'),

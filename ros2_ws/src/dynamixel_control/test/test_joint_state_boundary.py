@@ -79,3 +79,35 @@ def test_feedback_transport_exception_is_contained_and_fails_closed():
     assert 'joint feedback transport failed' in feedback
     assert 'self._mark_tool_feedback_offline()' in feedback
     assert 'self.fault_pub.publish(Bool(data=True))' in feedback
+
+
+def test_id5_control_table_short_response_is_recoverable():
+    class Packet:
+        short_response = True
+
+        def read1ByteTxRx(self, *_args):
+            return 0, 0, 0
+
+        def read4ByteTxRx(self, *_args):
+            if self.short_response:
+                raise IndexError('short response')
+            return 20, 0, 0
+
+    bridge = object.__new__(MoveItDynamixelBridge)
+    bridge.tool_ids = [5]
+    bridge.tool_type = 'spur_1motor_gripper'
+    bridge.control_scope = 'END_EFFECTOR_ONLY'
+    bridge.packet_handler = Packet()
+    bridge.port_handler = object()
+    bridge._bus_lock = __import__('threading').RLock()
+    bridge.get_logger = lambda: SimpleNamespace(warn=lambda _message: None)
+
+    sample = bridge._read_tool_control_state(5)
+    assert sample['torque_state'] == 'UNKNOWN'
+    assert sample['operating_mode'] is None
+    assert sample['profile_velocity'] is None
+    bridge.packet_handler.short_response = False
+    recovered = bridge._read_tool_control_state(5)
+    assert recovered['torque_state'] == 'OFF'
+    assert recovered['operating_mode'] == 0
+    assert recovered['profile_velocity'] == 20

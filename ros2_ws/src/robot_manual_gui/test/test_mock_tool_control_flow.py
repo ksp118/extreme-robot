@@ -99,13 +99,17 @@ def test_mock_runtime_dual_spur_cleaner_round_trip(monkeypatch, tmp_path):
         assert window.common_enable is window.spur_enable is window.dual_enable
         window.tool_combo.setCurrentIndex(window.tool_combo.findData('cleaner'))
         window._request_tool_change()
-        wait_for(lambda: gui.selected_tool == 'cleaner' and window.clean_start.isEnabled())
+        wait_for(lambda: gui.selected_tool == 'cleaner' and window.common_enable.isEnabled())
+        window.common_enable.click()
+        wait_for(lambda: window.clean_start.isEnabled())
         assert type(bridge.tool_fsm).__name__ == 'CleanerFSM'
         assert bridge.tool_ids == gui.actuator_ids == [6]
         assert bridge.cleaning_actuator_id == 6
         assert bridge.cleaning_actuator_joint == 'cleaning_actuator_joint'
         assert bridge.calibration_session is None
-        window.clean_start.click()
+        # Cleaner operation uses the same current-runtime FSM dispatcher as
+        # the tool-specific panel; the legacy action service is not the GUI path.
+        window.close_button.click()
         wait_for(lambda: bridge.cleaning_running and window.fsm_state == 'CLEANING')
         assert bridge._tool_samples[6]['velocity'] == -30
         window.clean_stop.click()
@@ -122,7 +126,7 @@ def test_mock_runtime_dual_spur_cleaner_round_trip(monkeypatch, tmp_path):
         assert not bridge.cleaning_running
         bridge.emergency_stop_active = False
         bridge.control_mode = 'MANUAL'
-        window.clean_start.click()
+        window.close_button.click()
         wait_for(lambda: bridge.cleaning_running)
         window.tool_combo.setCurrentIndex(window.tool_combo.findData('dual_motor_gripper'))
         window._request_tool_change()
@@ -146,8 +150,5 @@ def test_mock_runtime_dual_spur_cleaner_round_trip(monkeypatch, tmp_path):
         window.common_disable.click()
         wait_for(lambda: bridge.read_torque(3) == bridge.read_torque(4) == 0)
     finally:
-        window.close()
-        executor.shutdown()
-        gui.destroy_node()
-        bridge.destroy_node()
-        rclpy.shutdown()
+        from conftest import shutdown_qt_ros_runtime
+        shutdown_qt_ros_runtime(app, window, executor, (gui, bridge), rclpy)

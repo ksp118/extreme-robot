@@ -17,6 +17,7 @@ def generate_launch_description():
     start_fsm = LaunchConfiguration('start_fsm')
     read_only = LaunchConfiguration('read_only')
     control_scope = LaunchConfiguration('control_scope')
+    auto_enable = LaunchConfiguration('auto_enable_on_attach')
     developer_direct_mode = LaunchConfiguration('developer_direct_mode')
     gripper_tolerance = LaunchConfiguration('gripper_target_tolerance_ticks')
     temporary_jog_mode = LaunchConfiguration('temporary_jog_mode')
@@ -51,6 +52,9 @@ def generate_launch_description():
         DeclareLaunchArgument('read_only', default_value='false'),
         DeclareLaunchArgument('control_scope', default_value='END_EFFECTOR_ONLY'),
         DeclareLaunchArgument(
+            'auto_enable_on_attach', default_value='false',
+            description='Enable a validated runtime attachment in END_EFFECTOR_ONLY scope.'),
+        DeclareLaunchArgument(
             'developer_direct_mode', default_value='false',
             description='ID5-only direct bench controls; retains physical safety gates.'),
         DeclareLaunchArgument(
@@ -82,6 +86,7 @@ def generate_launch_description():
                 'mock_mode': ParameterValue(mock_mode, value_type=bool),
                 'read_only': ParameterValue(read_only, value_type=bool),
                 'control_scope': control_scope,
+                'auto_enable_on_attach': ParameterValue(auto_enable, value_type=bool),
                 'developer_direct_mode': ParameterValue(
                     developer_direct_mode, value_type=bool),
                 'gripper_target_tolerance_ticks': ParameterValue(
