@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
     QLineEdit, QScrollArea, QTableWidget, QTableWidgetItem, QTextEdit,
-    QVBoxLayout, QWidget)
+    QSizePolicy, QVBoxLayout, QWidget)
 
 from robot_manual_gui.ros_interface import ARM_JOINTS
 from robot_manual_gui.korean_text import ko
@@ -167,28 +167,45 @@ class ManualMainWindow(QMainWindow):
         outer.addLayout(safety)
 
         columns = QHBoxLayout()
-        left = QVBoxLayout()
-        right = QVBoxLayout()
+        columns.setSpacing(20)
+        left_content = QWidget()
+        left = QVBoxLayout(left_content)
+        self.details_layout = left
+        right_content = QWidget()
+        right_content.setFixedWidth(380)
+        right = QVBoxLayout(right_content)
+        right.setAlignment(Qt.AlignTop)
         self.right_layout = right
         left.addWidget(self._status_group())
+        left.addWidget(self._tool_selection_group())
         left.addWidget(self._arm_group())
-        right.addWidget(self._tool_selection_group())
         self.tool_control_box = self._tool_control_group()
         right.addWidget(self.tool_control_box)
-        columns.addLayout(left, 3)
-        columns.addLayout(right, 2)
-        outer.addLayout(columns)
+        left.addWidget(self.tool_details_box)
 
         self.diag = QTableWidget(0, 5)
         self.diag.setHorizontalHeaderLabels(
             [ko('ID'), ko('Joint'), ko('Position'), ko('Current/Load'), ko('Online')])
-        outer.addWidget(self.diag)
+        self.diag.setMinimumHeight(140)
+        left.addWidget(self.diag)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(120)
-        outer.addWidget(self.log)
-        # Hardware panels can be taller/wider than a laptop display.  Keep the
-        # whole dashboard reachable instead of clipping its lower controls.
+        left.addWidget(self.log)
+        # Independent scrolling keeps changing telemetry/calibration text
+        # from moving the remote's buttons under the operator's pointer.
+        status_scroll = QScrollArea()
+        status_scroll.setWidgetResizable(True)
+        status_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        status_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        status_scroll.setWidget(left_content)
+        remote_scroll = QScrollArea()
+        remote_scroll.setWidgetResizable(True)
+        remote_scroll.setFixedWidth(404)
+        remote_scroll.setWidget(right_content)
+        columns.addWidget(status_scroll, 1)
+        columns.addWidget(remote_scroll)
+        outer.addLayout(columns, 1)
         self.content_widget = root
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -211,6 +228,8 @@ class ManualMainWindow(QMainWindow):
                 ('calibration_valid', 'Calibration / endpoints valid'),
                 ('actuators_discovered', 'Actuators discovered'),
                 ('motion_allowed', 'Motion allowed'), ('fsm', 'FSM state'),
+                ('preparation', '도구 준비'),
+                ('motor_health', '모터 / 토크 / 하드웨어 오류'),
                 ('arm_fsm', '팔 FSM'), ('arm_status', 'Arm contract state'), ('mode', 'Control mode'),
                 ('dual_online', 'ID3 / ID4 online'),
                 ('dual_positions', 'ID3 / ID4 positions'),
@@ -224,6 +243,9 @@ class ManualMainWindow(QMainWindow):
                 ('spur_operating_mode', 'ID5 운전 모드'),
                 ('contact', 'Contact sensor')):
             label = QLabel(ko('UNKNOWN'))
+            label.setWordWrap(True)
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             self.status_labels[key] = label
             title_label = QLabel(ko(title))
             self.status_titles[key] = title_label
@@ -239,15 +261,28 @@ class ManualMainWindow(QMainWindow):
             visible = (tool == 'dual_motor_gripper' if key.startswith('dual_')
                        else tool == 'spur_1motor_gripper' if key.startswith('spur_')
                        else True)
-            if tool == 'spur_1motor_gripper':
-                # The request/blocked rows explain a locked panel, so they stay
-                # readable in every tool context.
-                visible = (key.startswith('spur_')
-                           or key in ('fsm', 'tool_change', 'tool_block'))
             label.setVisible(visible)
             self.status_titles[key].setVisible(visible)
         if hasattr(self, 'diag'):
-            self.diag.setVisible(tool != 'spur_1motor_gripper')
+            self.diag.setVisible(True)
+        self.status_labels['preparation'].setText(
+            ko(status.get('tool_preparation_state', 'UNKNOWN')))
+        self.status_labels['motor_health'].setText('\n'.join(
+            ko(f'ID {item.get("id", "?")} · online={item.get("online", "UNKNOWN")} '
+               f'· torque {item.get("torque_state", "UNKNOWN")} '
+               f'· hardware_error {item.get("hardware_error", "UNKNOWN")}')
+            for item in status.get('actuators', [])) or ko('UNKNOWN'))
+        if hasattr(self, 'remote_tool_name'):
+            names = {'dual_motor_gripper': '2모터 그리퍼',
+                     'spur_1motor_gripper': '1모터 스퍼 그리퍼',
+                     'cleaner': '클리너'}
+            reported = status.get('tool_type')
+            self.remote_tool_name.setText(names.get(reported, '도구 확인 중'))
+            self.remote_state.setText(status.get('fsm_state') or 'UNKNOWN')
+            self.remote_torque.setText(
+                'Torque: ' + status.get('tool_torque_state', 'UNKNOWN'))
+            self.remote_ids.setText('ID ' + (', '.join(
+                str(item.get('id', '?')) for item in status.get('actuators', [])) or '—'))
         sample = next((item for item in status.get('actuators', [])
                        if item.get('id') == 5), {}) if tool == 'spur_1motor_gripper' else {}
         for key, field in (('spur_online', 'online'), ('spur_position', 'position'),
@@ -366,8 +401,51 @@ class ManualMainWindow(QMainWindow):
         # This panel is rebuilt when the active runtime tool changes. Clear
         # references to widgets belonging to the previous tool first.
         self._clear_tool_specific_widget_refs()
-        box = QGroupBox(ko('End Effector'))
-        layout = QVBoxLayout(box)
+        box = QGroupBox('엔드이펙터 리모컨')
+        box.setObjectName('toolRemote')
+        box.setStyleSheet('''
+            QGroupBox#toolRemote { background: #f6f8fc; color: #203047;
+                border: 1px solid #d5deea; border-radius: 16px;
+                margin-top: 12px; padding: 18px 12px 12px; }
+            QGroupBox#toolRemote::title { subcontrol-origin: margin; left: 18px; }
+            QGroupBox#toolRemote QLabel { color: #203047; background: transparent; }
+            QGroupBox#toolRemote QPushButton { background: white; color: #203047;
+                border: 1px solid #c9d5e4; border-radius: 12px;
+                font-size: 17px; font-weight: bold; padding: 6px; }
+            QGroupBox#toolRemote QPushButton:hover { background: #eaf0fa; }
+            QGroupBox#toolRemote QPushButton:pressed { background: #d6e3f7; }
+            QGroupBox#toolRemote QPushButton#remoteEnable {
+                background: #2563eb; color: white; border-color: #2563eb; }
+            QGroupBox#toolRemote QPushButton#remoteEnable:hover { background: #1d4ed8; }
+            QGroupBox#toolRemote QPushButton#remoteEnable:pressed { background: #1e40af; }
+            QGroupBox#toolRemote QPushButton#remoteStop {
+                background: #c6283e; color: white; border-color: #c6283e; }
+            QGroupBox#toolRemote QPushButton#remoteStop:hover { background: #ae2034; }
+            QGroupBox#toolRemote QPushButton#remoteStop:pressed { background: #8d192a; }
+            QGroupBox#toolRemote QPushButton:disabled,
+            QGroupBox#toolRemote QPushButton#remoteEnable:disabled,
+            QGroupBox#toolRemote QPushButton#remoteStop:disabled {
+                background: #e8edf3; color: #8793a4; border-color: #d9e0e9; }
+        ''')
+        remote = QVBoxLayout(box)
+        remote.setSpacing(14)
+        remote.addWidget(QLabel('현재 도구'))
+        self.remote_tool_name = QLabel('도구 확인 중')
+        self.remote_tool_name.setStyleSheet('font-size: 24px; font-weight: bold;')
+        self.remote_state = QLabel('UNKNOWN')
+        self.remote_ids = QLabel('ID —')
+        self.remote_torque = QLabel('Torque: UNKNOWN')
+        self.remote_torque.setStyleSheet('font-size: 18px; font-weight: bold;')
+        remote.addWidget(self.remote_tool_name)
+        state_row = QHBoxLayout()
+        state_row.addWidget(self.remote_state)
+        state_row.addStretch()
+        state_row.addWidget(self.remote_ids)
+        remote.addLayout(state_row)
+        remote.addWidget(self.remote_torque)
+        remote.addSpacing(8)
+        self.tool_details_box = QGroupBox('도구 상세 / 캘리브레이션')
+        layout = QVBoxLayout(self.tool_details_box)
         self.profile_text = QLabel(ko(self._profile_summary()))
         self.profile_text.setWordWrap(True)
         layout.addWidget(self.profile_text)
@@ -503,13 +581,29 @@ class ManualMainWindow(QMainWindow):
             self.hold_close_button.released.connect(self._common_release)
             self.spur_enable = self.dual_enable = self.common_enable
             self.spur_disable = self.dual_disable = self.common_disable
-        for widgets in ((self.close_button, self.open_button, self.tool_stop),
-                        (self.hold_open_button, self.hold_close_button),
-                        (self.common_enable, self.common_disable)):
-            row = QHBoxLayout()
-            for widget in widgets:
-                row.addWidget(widget)
-            layout.addLayout(row)
+        # Only geometry/text changes: the persistent buttons above keep all
+        # original pressed/released/clicked connections and dispatchers.
+        for button in self._common_buttons():
+            button.setMinimumHeight(56)
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.tool_stop.setObjectName('remoteStop')
+        self.tool_stop.setText('■ 정지')
+        self.common_enable.setObjectName('remoteEnable')
+        self.hold_open_button.setText('누르는 동안 열기')
+        self.hold_close_button.setText('누르는 동안 닫기')
+        remote.addWidget(self.tool_stop)
+        actions = QGridLayout()
+        actions.setSpacing(12)
+        actions.setColumnStretch(0, 1)
+        actions.setColumnStretch(1, 1)
+        actions.addWidget(self.close_button, 0, 0)
+        actions.addWidget(self.open_button, 0, 1)
+        actions.addWidget(self.common_disable, 1, 0)
+        actions.addWidget(self.common_enable, 1, 1)
+        remote.addLayout(actions)
+        remote.addSpacing(6)
+        remote.addWidget(self.hold_open_button)
+        remote.addWidget(self.hold_close_button)
         self.dual_recovery_buttons = []
         if self.node.selected_tool == 'dual_motor_gripper':
             recovery = QGroupBox(ko('MANUAL DUAL MOTOR RECOVERY (one click only)'))
@@ -894,8 +988,8 @@ class ManualMainWindow(QMainWindow):
     def _refresh_common_buttons(self):
         self._refresh_legacy_common_buttons()
         cleaner = self.node.selected_tool == 'cleaner'
-        self.close_button.setText('버튼 1 · 좌회전' if cleaner else '버튼 1 · 집는 방향')
-        self.open_button.setText('버튼 2 · 우회전' if cleaner else '버튼 2 · 여는 방향')
+        self.close_button.setText('좌회전' if cleaner else '닫기')
+        self.open_button.setText('우회전' if cleaner else '열기')
         self.close_button.setVisible(True)
         self.open_button.setVisible(True)
         self.tool_stop.setVisible(True)
@@ -926,7 +1020,8 @@ class ManualMainWindow(QMainWindow):
         if self.node.control_scope == 'FULL_ROBOT':
             allowed = {self.close_button, self.open_button, self.tool_stop,
                        self.common_enable, self.common_disable, self.read_diag}
-            for button in self.tool_control_box.findChildren(QPushButton):
+            for button in (self.tool_control_box.findChildren(QPushButton)
+                           + self.tool_details_box.findChildren(QPushButton)):
                 button.setVisible(button in allowed)
 
     def _refresh_legacy_common_buttons(self):
@@ -1018,8 +1113,13 @@ class ManualMainWindow(QMainWindow):
             old.setEnabled(False)
             old.hide()
             old.deleteLater()
+            details = self.tool_details_box
+            self.details_layout.removeWidget(details)
+            details.hide()
+            details.deleteLater()
         self.tool_control_box = self._tool_control_group()
         self.right_layout.addWidget(self.tool_control_box)
+        self.details_layout.insertWidget(3, self.tool_details_box)
 
     def _connect_signals(self):
         self.signals.joint_states.connect(self._update_joints)
@@ -1411,6 +1511,8 @@ class ManualMainWindow(QMainWindow):
     def _refresh_buttons(self):
         self._refresh_tool_change_labels()
         self.tool_control_box.setEnabled(self.pending_tool_change is None)
+        # The same existing parent gate also covers the relocated widgets.
+        self.tool_details_box.setEnabled(self.tool_control_box.isEnabled())
         manual = self.control_mode == 'MANUAL'
         end_effector_only = self.node.control_scope == 'END_EFFECTOR_ONLY'
         for widget in self.arm_buttons:

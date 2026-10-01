@@ -346,7 +346,14 @@ def test_korean_display_preserves_protocol_values():
     assert requests == ['MANUAL']
     assert window.control_mode == 'MANUAL'
     assert window.fsm_state == 'READY'
+    # The remote intentionally shows the requested runtime notation; all
+    # existing controls and detailed status labels remain Korean.
+    assert window.remote_state.text() == 'READY'
+    assert window.remote_ids.text() == 'ID 3, 4'
+    assert window.remote_torque.text() == 'Torque: ' + status.get('tool_torque_state', 'UNKNOWN')
     for widget in window.findChildren((QLabel, QPushButton, QGroupBox)):
+        if widget in (window.remote_state, window.remote_ids, window.remote_torque):
+            continue
         text = widget.title() if isinstance(widget, QGroupBox) else widget.text()
         assert not re.search('[A-Za-z]', text), text
     window.close()
