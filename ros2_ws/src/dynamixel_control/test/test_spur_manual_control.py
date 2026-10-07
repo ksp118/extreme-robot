@@ -72,3 +72,19 @@ def test_repeated_manual_enable_is_idempotent_after_torque_is_on():
     c.command('manual_enable')
     c.command('manual_enable')
     assert writes == [(5, True)]
+
+
+def test_full_robot_allows_tool_torque_but_not_bench_motion():
+    b, c = make_control()
+    b.control_scope = 'FULL_ROBOT'
+    b.torque = 0
+    b.tool_fsm.startup = lambda: b.tool_fsm.state
+    b.tool_fsm.disable = lambda: b.set_torque(5, False)
+    c.command('manual_enable')
+    assert b.torque == 1
+    for command in ('manual_step', 'manual_open', 'manual_close'):
+        with pytest.raises(RuntimeError, match='end-effector scope'):
+            c.command(command, 0.5)
+    assert b.position == 150
+    c.command('manual_disable')
+    assert b.torque == 0

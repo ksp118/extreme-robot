@@ -149,7 +149,7 @@ def test_confirmed_replacement_clears_manual_detach_latch_but_not_estop():
     assert 'emergency stop' in bridge._tool_detection_reason
 
 
-def test_same_tool_reattachment_is_revalidated_without_runtime_switch():
+def test_same_tool_reattachment_uses_the_runtime_switch_in_bench_scope():
     bridge = _bridge([None, None, 'dual_motor_gripper',
                       'dual_motor_gripper'])
     bridge.tool_ids = [3, 4]
@@ -161,10 +161,57 @@ def test_same_tool_reattachment_is_revalidated_without_runtime_switch():
         startup=lambda: SimpleNamespace(name='READY'), fault_reason='')
     for _ in range(4):
         bridge._poll_physical_tool()
-    assert bridge._switches == []
-    assert bridge.tool_discovered
-    assert bridge.active_ids == {3, 4}
+    assert bridge._switches == ['dual_motor_gripper']
     assert not bridge._physical_tool_detached
+
+
+def test_live_same_tool_detection_never_rebuilds_runtime_context():
+    """A stable dual signature is observation-only after its confirmation."""
+    bridge = _bridge(['dual_motor_gripper'] * 30)
+    status_ticks = []
+    bridge.publish_tool_status = lambda: status_ticks.append(1)
+    for _ in range(30):
+        bridge._poll_physical_tool()
+        bridge._publish_tool_status_safely()
+        assert not bridge._auto_detection_in_progress
+    assert bridge._switches == []
+    assert len(status_ticks) == 30
+
+
+def test_detection_exception_releases_guard_and_later_status_still_publishes():
+    """A bad scan is diagnostic data, not a dead timer or locked callback."""
+    bridge = _bridge([])
+    calls = [RuntimeError('probe timeout'), 'dual_motor_gripper']
+    bridge._bus_tool_identity.detected_tool_type = lambda: (
+        (_ for _ in ()).throw(calls.pop(0))
+        if isinstance(calls[0], Exception) else calls.pop(0))
+    status_ticks = []
+    bridge.publish_tool_status = lambda: status_ticks.append(1)
+    bridge._poll_physical_tool()
+    bridge._publish_tool_status_safely()
+    assert not bridge._auto_detection_in_progress
+    assert 'automatic detection failed' in bridge._tool_detection_reason
+    bridge._poll_physical_tool()
+    bridge._publish_tool_status_safely()
+    assert len(status_ticks) == 2
+    assert not bridge._auto_detection_in_progress
+
+
+def test_status_publish_does_not_compete_for_serial_bus_lock():
+    """Status is built from cached samples and stays live during a probe."""
+    source = (__import__('pathlib').Path(__file__).parents[1] /
+              'dynamixel_control/moveit_dynamixel_bridge.py').read_text()
+    start = source.index('    def _publish_tool_status_safely')
+    end = source.index('    def tool_change_callback', start)
+    status = source[start:end]
+    assert '_bus_lock.acquire' not in status
+    start = source.index('    def _switch_tool_runtime(')
+    end = source.index('    def _clear_runtime_sessions', start)
+    switch = source[start:end]
+    assert 'with self._bus_lock:' not in switch
+    probe = source[source.index('    def _probe_tool_id'):
+                   source.index('    def _rescan_physical_tool')]
+    assert 'with self._bus_lock:' in probe
 
 
 def test_cleaner_id2_signature_is_polled_as_a_physical_tool():
