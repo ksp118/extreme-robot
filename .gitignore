@@ -48,3 +48,8 @@ ros2_ws/*.npy
 # camera_tf_tuner 의 save 서비스 산출물 (벤치/장착마다 다른 실측값 — 확정되면
 # camera_tf.launch.py 기본값에 직접 반영한다)
 ros2_ws/camera_tf_calib.txt
+
+# Powertrain local credentials
+*.token
+config/powertrain/operator.json
+config/powertrain/ops_console.token
